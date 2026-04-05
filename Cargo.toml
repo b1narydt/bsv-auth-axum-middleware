@@ -1,0 +1,43 @@
+[package]
+name = "bsv-auth-axum-middleware"
+version = "0.1.0"
+edition = "2021"
+description = "BSV BRC-31 authentication middleware for axum — ported from bsv-auth-actix-middleware"
+license = "MIT"
+
+[lib]
+name = "bsv_auth_axum_middleware"
+
+[dependencies]
+# BSV SDK — must match the version used by the messagebox server and client
+bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", branch = "main", features = ["network"] }
+
+# Axum + tower
+axum = { version = "0.8", features = ["json"] }
+tower = "0.5"
+http = "1"
+http-body-util = "0.1"
+
+# Async
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+futures-util = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+base64 = "0.22"
+
+# Error handling
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+
+# Certificate gating
+dashmap = "6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
