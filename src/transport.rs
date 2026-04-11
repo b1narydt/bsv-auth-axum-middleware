@@ -23,13 +23,13 @@ use crate::error::AuthMiddlewareError;
 /// message correlation. The `subscribe()` method returns an mpsc receiver
 /// for the Peer to consume incoming messages.
 pub struct ActixTransport {
-    /// Pending response senders keyed by nonce/request_id.
+    /// Pending response senders keyed by `nonce/request_id`.
     pending: Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<AuthMessage>>>>,
     /// Sender for feeding incoming messages to the Peer's subscription channel.
     incoming_tx: mpsc::Sender<AuthMessage>,
     /// Receiver taken once by the Peer via `subscribe()`.
-    /// Uses std::sync::Mutex because `subscribe()` is a sync fn that may be
-    /// called from within an async runtime (Peer::new calls it).
+    /// Uses `std::sync::Mutex` because `subscribe()` is a sync fn that may be
+    /// called from within an async runtime (`Peer::new` calls it).
     incoming_rx: std::sync::Mutex<Option<mpsc::Receiver<AuthMessage>>>,
 }
 
@@ -41,6 +41,7 @@ impl Default for ActixTransport {
 
 impl ActixTransport {
     /// Create a new transport with an internal mpsc channel.
+    #[must_use]
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel(1024);
         Self {
@@ -59,9 +60,15 @@ impl ActixTransport {
     }
 
     /// Feed an incoming auth message to the Peer's subscription channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthMiddlewareError::Transport`] if the incoming channel has
+    /// been closed — typically because the subscriber (the `Peer` internals)
+    /// dropped the receiver side before the middleware could feed a message.
     pub async fn feed_incoming(&self, message: AuthMessage) -> Result<(), AuthMiddlewareError> {
         self.incoming_tx.send(message).await.map_err(|e| {
-            AuthMiddlewareError::Transport(format!("failed to send incoming message: {}", e))
+            AuthMiddlewareError::Transport(format!("failed to send incoming message: {e}"))
         })
     }
 }
@@ -84,7 +91,7 @@ impl Transport for ActixTransport {
             .to_string();
 
         let sender = self.pending.lock().await.remove(&key).ok_or_else(|| {
-            AuthError::TransportError(format!("no pending request for nonce: {}", key))
+            AuthError::TransportError(format!("no pending request for nonce: {key}"))
         })?;
 
         // Deliver the message. If the receiver was dropped, ignore the error.
@@ -307,14 +314,14 @@ mod tests {
         }
     }
 
-    /// Helper: create a minimal AuthMessage with given your_nonce.
+    /// Helper: create a minimal `AuthMessage` with given `your_nonce`.
     fn make_message(your_nonce: Option<&str>) -> AuthMessage {
         AuthMessage {
             version: "0.1".to_string(),
             message_type: MessageType::General,
             identity_key: "test-key".to_string(),
             nonce: Some("my-nonce".to_string()),
-            your_nonce: your_nonce.map(|s| s.to_string()),
+            your_nonce: your_nonce.map(std::string::ToString::to_string),
             initial_nonce: None,
             certificates: None,
             requested_certificates: None,

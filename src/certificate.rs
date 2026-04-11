@@ -26,6 +26,7 @@ pub struct CertificateGate {
 
 impl CertificateGate {
     /// Create a new certificate gate with an empty pending map.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             pending: Arc::new(DashMap::new()),
@@ -36,6 +37,7 @@ impl CertificateGate {
     ///
     /// If a gate already exists for this key, the existing `Notify` is returned.
     /// Multiple waiters on the same identity key share the same `Notify`.
+    #[must_use]
     pub fn register(&self, identity_key: &str) -> Arc<Notify> {
         self.pending
             .entry(identity_key.to_string())
@@ -79,48 +81,42 @@ pub async fn certificate_listener_task(
     loop {
         tokio::select! {
             msg = cert_rx.recv() => {
-                match msg {
-                    Some((sender_key, certs)) => {
-                        tracing::info!(
-                            sender = %sender_key,
-                            count = certs.len(),
-                            "certificates received from peer"
-                        );
+                if let Some((sender_key, certs)) = msg {
+                    tracing::info!(
+                        sender = %sender_key,
+                        count = certs.len(),
+                        "certificates received from peer"
+                    );
 
-                        // 1. Invoke callback fire-and-forget
-                        if let Some(ref cb) = callback {
-                            let cb = Arc::clone(cb);
-                            let key = sender_key.clone();
-                            tokio::spawn(async move {
-                                // Catch panics from the callback via JoinHandle
-                                let fut = cb(key, certs);
-                                fut.await;
-                            });
-                        }
+                    // 1. Invoke callback fire-and-forget
+                    if let Some(ref cb) = callback {
+                        let cb = Arc::clone(cb);
+                        let key = sender_key.clone();
+                        tokio::spawn(async move {
+                            // Catch panics from the callback via JoinHandle
+                            let fut = cb(key, certs);
+                            fut.await;
+                        });
+                    }
 
-                        // 2. Release gated request
-                        gate.release(&sender_key);
-                    }
-                    None => {
-                        tracing::debug!("certificate receiver closed");
-                        // Check if other channel is also closed
-                        // by letting select! handle it on next iteration
-                        break;
-                    }
+                    // 2. Release gated request
+                    gate.release(&sender_key);
+                } else {
+                    tracing::debug!("certificate receiver closed");
+                    // Check if other channel is also closed
+                    // by letting select! handle it on next iteration
+                    break;
                 }
             }
             msg = cert_req_rx.recv() => {
-                match msg {
-                    Some((sender_key, _requested)) => {
-                        tracing::debug!(
-                            sender = %sender_key,
-                            "certificate request received from peer (handled by Peer internally)"
-                        );
-                    }
-                    None => {
-                        tracing::debug!("certificate request receiver closed");
-                        break;
-                    }
+                if let Some((sender_key, _requested)) = msg {
+                    tracing::debug!(
+                        sender = %sender_key,
+                        "certificate request received from peer (handled by Peer internally)"
+                    );
+                } else {
+                    tracing::debug!("certificate request receiver closed");
+                    break;
                 }
             }
         }
@@ -190,7 +186,7 @@ mod tests {
 
         let gate = CertificateGate::new();
         let (cert_tx, cert_rx) = mpsc::channel(8);
-        let (_cert_req_tx, cert_req_rx) = mpsc::channel(8);
+        let (cert_req_tx, cert_req_rx) = mpsc::channel(8);
 
         let task = tokio::spawn(certificate_listener_task(
             cert_rx,
@@ -215,7 +211,7 @@ mod tests {
 
         // Drop senders to close channels and let task exit
         drop(cert_tx);
-        drop(_cert_req_tx);
+        drop(cert_req_tx);
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }
 
@@ -225,7 +221,7 @@ mod tests {
         let notify = gate.register("sender_1");
 
         let (cert_tx, cert_rx) = mpsc::channel(8);
-        let (_cert_req_tx, cert_req_rx) = mpsc::channel(8);
+        let (cert_req_tx, cert_req_rx) = mpsc::channel(8);
 
         let task = tokio::spawn(certificate_listener_task(
             cert_rx,
@@ -245,7 +241,7 @@ mod tests {
         assert!(result.is_ok(), "gate should have been released");
 
         drop(cert_tx);
-        drop(_cert_req_tx);
+        drop(cert_req_tx);
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }
 
@@ -277,7 +273,7 @@ mod tests {
 
         let gate = CertificateGate::new();
         let (cert_tx, cert_rx) = mpsc::channel(8);
-        let (_cert_req_tx, cert_req_rx) = mpsc::channel(8);
+        let (cert_req_tx, cert_req_rx) = mpsc::channel(8);
 
         let task = tokio::spawn(certificate_listener_task(
             cert_rx,
@@ -297,7 +293,7 @@ mod tests {
 
         // The listener task itself should still be alive -- drop channels to exit
         drop(cert_tx);
-        drop(_cert_req_tx);
+        drop(cert_req_tx);
 
         let result = tokio::time::timeout(Duration::from_secs(2), task).await;
         assert!(result.is_ok(), "listener task should have completed");
