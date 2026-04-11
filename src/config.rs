@@ -425,7 +425,9 @@ mod tests {
     #[test]
     fn test_certificates_to_request_can_be_set() {
         let mut certs = RequestedCertificateSet::default();
-        certs.types.insert("certifier1".to_string(), vec!["field1".to_string()]);
+        certs
+            .types
+            .insert("certifier1".to_string(), vec!["field1".to_string()]);
 
         let config = AuthMiddlewareConfigBuilder::new()
             .wallet(MockWallet)

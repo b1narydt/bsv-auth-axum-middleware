@@ -160,7 +160,11 @@ where
 
                     // 2. Build AuthMessage from request
                     let raw_headers = headers_from_map(&parts.headers);
-                    let query = parts.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+                    let query = parts
+                        .uri
+                        .query()
+                        .map(|q| format!("?{q}"))
+                        .unwrap_or_default();
                     let auth_msg = build_auth_message(
                         parts.method.as_str(),
                         parts.uri.path(),
@@ -336,7 +340,10 @@ where
         }
     };
 
-    debug!("Handshake response ready: identity_key={}", response_msg.identity_key);
+    debug!(
+        "Handshake response ready: identity_key={}",
+        response_msg.identity_key
+    );
 
     // Build response with auth headers
     let resp_json = serde_json::to_vec(&response_msg).unwrap_or_default();
@@ -412,7 +419,10 @@ where
         }
     };
 
-    debug!("Response signed for identity_key={}", signed_msg.identity_key);
+    debug!(
+        "Response signed for identity_key={}",
+        signed_msg.identity_key
+    );
 
     // 4. Rebuild response with original headers + auth headers
     let mut builder = Response::builder().status(status);
