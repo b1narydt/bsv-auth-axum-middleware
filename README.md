@@ -140,10 +140,10 @@ the initial handshake. Use `CertificateGate` and the `certificates_to_request`
 configuration option to require specific certificates from peers:
 
 ```rust,ignore
-use std::collections::HashMap;
+use bsv::auth::types::RequestedCertificateSet;
 
-let mut certs: HashMap<String, Vec<String>> = HashMap::new();
-certs.insert("certifier_id".into(), vec!["field_name".into()]);
+let mut certs = RequestedCertificateSet::default();
+certs.types.insert("certifier_id".into(), vec!["field_name".into()]);
 
 let config = AuthMiddlewareConfigBuilder::new()
     .wallet(wallet)
