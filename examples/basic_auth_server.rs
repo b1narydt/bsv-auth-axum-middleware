@@ -27,7 +27,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::{Router, routing::get};
+use axum::{routing::get, Router};
 use tokio::net::TcpListener;
 
 use bsv::auth::peer::Peer;

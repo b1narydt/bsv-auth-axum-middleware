@@ -40,11 +40,7 @@ pub fn extract_auth_headers(headers: &HeaderMap) -> Option<AuthHeaders> {
         .to_str()
         .ok()?
         .to_string();
-    let nonce = headers
-        .get("x-bsv-auth-nonce")?
-        .to_str()
-        .ok()?
-        .to_string();
+    let nonce = headers.get("x-bsv-auth-nonce")?.to_str().ok()?.to_string();
     let your_nonce = headers
         .get("x-bsv-auth-your-nonce")?
         .to_str()

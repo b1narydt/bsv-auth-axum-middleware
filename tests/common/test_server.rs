@@ -9,12 +9,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    Router,
     body::Bytes,
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post, put},
+    Router,
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -71,8 +71,7 @@ impl Drop for TestServerHandle {
 pub async fn create_test_server() -> String {
     // Bind the port *now* in the current async context so the port is reserved
     // before we return the URL.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind test listener");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     listener.set_nonblocking(true).expect("set_nonblocking");
     let addr: SocketAddr = listener.local_addr().expect("local_addr");
     let base_url = format!("http://{}", addr);
@@ -116,8 +115,8 @@ pub async fn create_test_server() -> String {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("create server runtime");
         rt.block_on(async move {
-            let tokio_listener = TcpListener::from_std(listener)
-                .expect("convert to tokio listener");
+            let tokio_listener =
+                TcpListener::from_std(listener).expect("convert to tokio listener");
             axum::serve(tokio_listener, app)
                 .await
                 .expect("test server serve");
@@ -316,15 +315,11 @@ pub async fn create_cert_test_server() -> CertTestContext {
 
     let app = Router::new()
         .route("/", get(handler_root))
-        .route(
-            "/cert-protected-endpoint",
-            post(handler_cert_protected),
-        )
+        .route("/cert-protected-endpoint", post(handler_cert_protected))
         .with_state(certs_received_state)
         .layer(layer);
 
-    let std_listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind cert test listener");
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind cert test listener");
     std_listener.set_nonblocking(true).expect("set_nonblocking");
     let addr: SocketAddr = std_listener.local_addr().expect("local_addr");
     let base_url = format!("http://{}", addr);
@@ -340,8 +335,7 @@ pub async fn create_cert_test_server() -> CertTestContext {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("create cert server runtime");
         rt.block_on(async move {
-            let listener = TcpListener::from_std(std_listener)
-                .expect("convert to tokio listener");
+            let listener = TcpListener::from_std(std_listener).expect("convert to tokio listener");
             axum::serve(listener, app)
                 .await
                 .expect("cert test server serve");
