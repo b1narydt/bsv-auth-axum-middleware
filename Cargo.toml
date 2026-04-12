@@ -10,6 +10,7 @@ homepage = "https://github.com/b1narydt/bsv-auth-axum-middleware"
 readme = "README.md"
 keywords = ["bsv", "authentication", "axum", "brc-31", "middleware"]
 categories = ["web-programming::http-server", "authentication"]
+exclude = ["docs/*"]
 
 [package.metadata.docs.rs]
 all-features = true
