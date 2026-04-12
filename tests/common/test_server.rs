@@ -58,11 +58,30 @@ impl Drop for TestServerHandle {
 ///
 /// Mirrors the actix `create_test_server()` API: a single server with
 /// `allow_unauthenticated(false)` and the same set of routes as the actix
-/// implementation. The server is leaked (kept alive for the process lifetime)
-/// just like the actix version.
+/// implementation.
+///
+/// The server runs in a dedicated background thread with its own Tokio
+/// multi-thread runtime. This means it outlives any individual `#[tokio::test]`
+/// runtime — each `#[tokio::test]` creates a fresh runtime on each invocation,
+/// so spawning into the test runtime would not persist the server across tests.
+/// Running in a dedicated thread avoids that lifetime problem while keeping the
+/// axum::serve loop alive for the process lifetime (the thread is leaked via
+/// `std::thread::spawn` without joining, matching the actix `std::mem::forget`
+/// pattern).
 pub async fn create_test_server() -> String {
+    // Bind the port *now* in the current async context so the port is reserved
+    // before we return the URL.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind test listener");
+    listener.set_nonblocking(true).expect("set_nonblocking");
+    let addr: SocketAddr = listener.local_addr().expect("local_addr");
+    let base_url = format!("http://{}", addr);
+
     let server_key = PrivateKey::from_random().expect("failed to generate server key");
     let server_wallet = MockWallet::new(server_key);
+
+    // Build config + layer in the calling async context so we don't have to
+    // send `ActixTransport` across threads without proper setup.
     let transport = Arc::new(ActixTransport::new());
     let peer = Arc::new(tokio::sync::Mutex::new(Peer::new(
         server_wallet.clone(),
@@ -89,22 +108,21 @@ pub async fn create_test_server() -> String {
         .route("/custom-headers", get(handler_custom_headers))
         .layer(layer);
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind test listener");
-    let addr: SocketAddr = listener.local_addr().expect("local_addr");
-    let base_url = format!("http://{}", addr);
-
     println!("Test server started at {}", base_url);
 
-    // Leak the server task to keep it alive for the process lifetime.
-    // Tests are run with sequential execution for shared-server tests.
-    let task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("test server serve");
+    // Spawn a background thread with its own Tokio runtime. The thread is
+    // leaked (never joined) so the server lives for the process lifetime,
+    // matching the actix `std::mem::forget(server)` pattern.
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("create server runtime");
+        rt.block_on(async move {
+            let tokio_listener = TcpListener::from_std(listener)
+                .expect("convert to tokio listener");
+            axum::serve(tokio_listener, app)
+                .await
+                .expect("test server serve");
+        });
     });
-    std::mem::forget(task);
 
     base_url
 }
@@ -305,10 +323,10 @@ pub async fn create_cert_test_server() -> CertTestContext {
         .with_state(certs_received_state)
         .layer(layer);
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind cert test listener");
-    let addr: SocketAddr = listener.local_addr().expect("local_addr");
+    std_listener.set_nonblocking(true).expect("set_nonblocking");
+    let addr: SocketAddr = std_listener.local_addr().expect("local_addr");
     let base_url = format!("http://{}", addr);
 
     println!(
@@ -316,13 +334,19 @@ pub async fn create_cert_test_server() -> CertTestContext {
         base_url
     );
 
-    // Leak the server task to keep it alive
-    let task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("cert test server serve");
+    // Spawn a dedicated background thread with its own Tokio runtime,
+    // matching the pattern from create_test_server. The thread is leaked
+    // so the server lives for the process lifetime.
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("create cert server runtime");
+        rt.block_on(async move {
+            let listener = TcpListener::from_std(std_listener)
+                .expect("convert to tokio listener");
+            axum::serve(listener, app)
+                .await
+                .expect("cert test server serve");
+        });
     });
-    std::mem::forget(task);
 
     CertTestContext {
         server_base_url: base_url,

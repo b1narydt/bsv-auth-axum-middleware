@@ -338,6 +338,30 @@ where
     match auth_msg.message_type {
         bsv::auth::types::MessageType::CertificateResponse
         | bsv::auth::types::MessageType::CertificateRequest => {
+            // GAP G4: if a certificate-response carries no certificates, TS
+            // auth-express-middleware:437-442 short-circuits with 400 and the
+            // minimal body `{"status":"No certificates provided"}` (not the
+            // standard error shape). Mirror that exactly.
+            if matches!(
+                auth_msg.message_type,
+                bsv::auth::types::MessageType::CertificateResponse
+            ) && auth_msg
+                .certificates
+                .as_ref()
+                .map(|c| c.is_empty())
+                .unwrap_or(true)
+            {
+                warn!(
+                    identity_key = %auth_msg.identity_key,
+                    "certificate-response received with empty certs -- rejecting with 400"
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"status": "No certificates provided"})),
+                )
+                    .into_response();
+            }
+
             if let Err(e) = transport.feed_incoming(auth_msg).await {
                 error!("Failed to feed certificate message: {}", e);
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
