@@ -33,6 +33,7 @@ impl<W: WalletInterface> std::fmt::Debug for AuthMiddlewareConfig<W> {
                 "on_certificates_received",
                 &self.on_certificates_received.is_some(),
             )
+            .field("log_level", &self.log_level)
             .finish()
     }
 }
@@ -55,6 +56,43 @@ pub struct AuthMiddlewareConfig<W: WalletInterface> {
     pub session_manager: Option<SessionManager>,
     /// Optional callback invoked when certificates are received from a peer.
     pub on_certificates_received: Option<Arc<OnCertificatesReceived>>,
+    /// Optional verbosity for a default `tracing` subscriber.
+    ///
+    /// When `None` (the default), this crate does not install any tracing
+    /// subscriber — the caller is expected to configure tracing itself, which
+    /// is the idiomatic pattern for library consumers.
+    ///
+    /// When `Some(level)`, a default subscriber can be installed via
+    /// [`AuthMiddlewareConfig::try_init_tracing`] that filters log records at
+    /// or above `level`. Mirrors the `logLevel` option in the TypeScript
+    /// `auth-express-middleware`: `Level::ERROR` means only errors log,
+    /// `Level::DEBUG` means everything logs, and so on.
+    pub log_level: Option<tracing::Level>,
+}
+
+impl<W: WalletInterface> AuthMiddlewareConfig<W> {
+    /// Initialize a default `tracing_subscriber` using this config's `log_level`.
+    ///
+    /// - If `log_level` is `None`, this is a no-op and returns `Ok(())`. This
+    ///   matches the idiomatic library pattern where the caller owns tracing
+    ///   setup.
+    /// - If `log_level` is `Some(level)`, installs a default
+    ///   `tracing_subscriber::fmt` subscriber with a `LevelFilter` at `level`.
+    ///
+    /// Safe to call at most once per process: returns `Err(_)` if a global
+    /// subscriber has already been installed.
+    pub fn try_init_tracing(&self) -> Result<(), tracing_subscriber::util::TryInitError> {
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let Some(level) = self.log_level else {
+            return Ok(());
+        };
+
+        tracing_subscriber::fmt()
+            .with_max_level(level)
+            .finish()
+            .try_init()
+    }
 }
 
 /// Builder for `AuthMiddlewareConfig`.
@@ -68,6 +106,7 @@ pub struct AuthMiddlewareConfigBuilder<W: WalletInterface> {
     certificates_to_request: Option<RequestedCertificateSet>,
     session_manager: Option<SessionManager>,
     on_certificates_received: Option<Arc<OnCertificatesReceived>>,
+    log_level: Option<tracing::Level>,
 }
 
 impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
@@ -78,6 +117,8 @@ impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
     /// - `allow_unauthenticated`: false
     /// - `certificates_to_request`: None
     /// - `session_manager`: None
+    /// - `on_certificates_received`: None
+    /// - `log_level`: None (caller owns tracing setup)
     pub fn new() -> Self {
         Self {
             wallet: None,
@@ -85,6 +126,7 @@ impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
             certificates_to_request: None,
             session_manager: None,
             on_certificates_received: None,
+            log_level: None,
         }
     }
 
@@ -118,6 +160,20 @@ impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
         self
     }
 
+    /// Set the tracing verbosity for an optional default subscriber.
+    ///
+    /// Setting this field only records the desired level on the built config —
+    /// it does not itself install a subscriber. Call
+    /// [`AuthMiddlewareConfig::try_init_tracing`] after `build()` if you want
+    /// this crate to install a default `tracing_subscriber::fmt` subscriber
+    /// filtered at the given level. If you omit this call (or leave
+    /// `log_level` unset), the caller is expected to configure tracing
+    /// themselves, which is the idiomatic Rust library pattern.
+    pub fn log_level(mut self, level: tracing::Level) -> Self {
+        self.log_level = Some(level);
+        self
+    }
+
     /// Build the configuration.
     ///
     /// Returns `AuthMiddlewareError::Config` if the wallet has not been set.
@@ -132,10 +188,12 @@ impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
             certificates_to_request: self.certificates_to_request,
             session_manager: self.session_manager,
             on_certificates_received: self.on_certificates_received,
+            log_level: self.log_level,
         };
 
         tracing::info!(
             allow_unauthenticated = config.allow_unauthenticated,
+            log_level = ?config.log_level,
             "auth middleware configured"
         );
 
@@ -425,7 +483,9 @@ mod tests {
     #[test]
     fn test_certificates_to_request_can_be_set() {
         let mut certs = RequestedCertificateSet::default();
-        certs.types.insert("certifier1".to_string(), vec!["field1".to_string()]);
+        certs
+            .types
+            .insert("certifier1".to_string(), vec!["field1".to_string()]);
 
         let config = AuthMiddlewareConfigBuilder::new()
             .wallet(MockWallet)
@@ -481,5 +541,45 @@ mod tests {
         let builder = AuthMiddlewareConfigBuilder::<MockWallet>::default();
         let result = builder.build();
         assert!(result.is_err()); // no wallet set
+    }
+
+    #[test]
+    fn test_log_level_defaults_to_none() {
+        let config = AuthMiddlewareConfigBuilder::new()
+            .wallet(MockWallet)
+            .build()
+            .unwrap();
+        assert!(config.log_level.is_none());
+    }
+
+    #[test]
+    fn test_log_level_can_be_set_via_builder() {
+        let config = AuthMiddlewareConfigBuilder::new()
+            .wallet(MockWallet)
+            .log_level(tracing::Level::DEBUG)
+            .build()
+            .unwrap();
+        assert_eq!(config.log_level, Some(tracing::Level::DEBUG));
+
+        let config = AuthMiddlewareConfigBuilder::new()
+            .wallet(MockWallet)
+            .log_level(tracing::Level::WARN)
+            .build()
+            .unwrap();
+        assert_eq!(config.log_level, Some(tracing::Level::WARN));
+    }
+
+    #[test]
+    fn test_try_init_tracing_noop_when_level_is_none() {
+        // When `log_level` is None, `try_init_tracing` must not install a
+        // subscriber and must return Ok(()) — the caller owns tracing setup.
+        // Because this is a no-op, it is safe to call in any test regardless
+        // of global subscriber state.
+        let config = AuthMiddlewareConfigBuilder::new()
+            .wallet(MockWallet)
+            .build()
+            .unwrap();
+        assert!(config.log_level.is_none());
+        assert!(config.try_init_tracing().is_ok());
     }
 }

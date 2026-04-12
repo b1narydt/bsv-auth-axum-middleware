@@ -34,10 +34,10 @@ thiserror = "2"
 
 # Logging
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 # Certificate gating
 dashmap = "6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
