@@ -28,10 +28,10 @@ pub mod middleware;
 pub mod payload;
 pub mod transport;
 
-pub use certificate::CertificateGate;
+pub use certificate::{certificate_listener_task, CertificateGate};
 pub use config::{AuthMiddlewareConfig, AuthMiddlewareConfigBuilder, OnCertificatesReceived};
 pub use error::AuthMiddlewareError;
 pub use extractor::Authenticated;
 pub use helpers::{extract_auth_headers, AuthHeaders};
 pub use middleware::{AuthLayer, AuthService};
-pub use transport::ActixTransport;
+pub use transport::{ActixTransport, DEFAULT_PENDING_TIMEOUT};
