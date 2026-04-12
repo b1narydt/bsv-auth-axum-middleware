@@ -20,8 +20,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 name = "bsv_auth_axum_middleware"
 
 [dependencies]
-# BSV SDK — must match the version used by the messagebox server and client
-bsv-sdk = { version = "0.2", path = "../bsv-rust-sdk", features = ["network"] }
+# BSV SDK — resolved from crates.io. Downstream consumers (e.g. messagebox)
+# should pin the same major.minor to avoid two-instance trait-bound conflicts.
+bsv-sdk = { version = "0.2", features = ["network"] }
 
 # Axum + tower
 axum = { version = "0.8", features = ["json"] }
