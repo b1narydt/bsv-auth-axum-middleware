@@ -6,6 +6,18 @@
 //! - **HTTP wrapper layer:** Thin wrappers that extract data from `http` crate types
 //!   and delegate to the pure functions.
 
+// BRC-31 wire-format integer conversions: the varint encoding specified by the
+// protocol is defined against signed `i64` to match the TypeScript SDK's
+// `writeVarIntNum` (see bsv-rust-sdk auth_fetch.rs). Lengths are bounded by the
+// protocol; the casts are intentional and byte-for-byte compatible with the TS
+// implementation. Wrapping/truncation cannot occur for any BRC-31 message a
+// real peer would accept.
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
+
 use axum::http::{HeaderMap, StatusCode};
 
 // ---------------------------------------------------------------------------
@@ -13,25 +25,25 @@ use axum::http::{HeaderMap, StatusCode};
 // ---------------------------------------------------------------------------
 
 /// Write a signed Bitcoin-style varint.
-pub(crate) fn write_varint_num(buf: &mut Vec<u8>, val: i64) {
-    if val < 0 {
-        let uval = val as u64;
+pub(crate) fn write_varint_num(buf: &mut Vec<u8>, signed: i64) {
+    if signed < 0 {
+        let unsigned = signed as u64;
         buf.push(0xff);
-        buf.extend_from_slice(&uval.to_le_bytes());
+        buf.extend_from_slice(&unsigned.to_le_bytes());
         return;
     }
-    let val = val as u64;
-    if val < 0xfd {
-        buf.push(val as u8);
-    } else if val <= 0xffff {
+    let unsigned = signed as u64;
+    if unsigned < 0xfd {
+        buf.push(unsigned as u8);
+    } else if unsigned <= 0xffff {
         buf.push(0xfd);
-        buf.extend_from_slice(&(val as u16).to_le_bytes());
-    } else if val <= 0xffff_ffff {
+        buf.extend_from_slice(&(unsigned as u16).to_le_bytes());
+    } else if unsigned <= 0xffff_ffff {
         buf.push(0xfe);
-        buf.extend_from_slice(&(val as u32).to_le_bytes());
+        buf.extend_from_slice(&(unsigned as u32).to_le_bytes());
     } else {
         buf.push(0xff);
-        buf.extend_from_slice(&val.to_le_bytes());
+        buf.extend_from_slice(&unsigned.to_le_bytes());
     }
 }
 
@@ -40,6 +52,7 @@ pub(crate) fn write_varint_num(buf: &mut Vec<u8>, val: i64) {
 // ---------------------------------------------------------------------------
 
 /// Filter and sort request headers according to BRC-31 signing rules.
+#[must_use]
 pub fn filter_and_sort_request_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     let mut included: Vec<(String, String)> = headers
         .iter()
@@ -65,6 +78,7 @@ pub fn filter_and_sort_request_headers(headers: &[(String, String)]) -> Vec<(Str
 }
 
 /// Filter and sort response headers according to BRC-31 signing rules.
+#[must_use]
 pub fn filter_and_sort_response_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     let mut included: Vec<(String, String)> = headers
         .iter()
@@ -89,6 +103,7 @@ pub fn filter_and_sort_response_headers(headers: &[(String, String)]) -> Vec<(St
 // ---------------------------------------------------------------------------
 
 /// Serialize a request payload for BRC-31 signature verification.
+#[must_use]
 pub fn serialize_request_payload(
     request_nonce: &[u8],
     method: &str,
@@ -104,20 +119,20 @@ pub fn serialize_request_payload(
     write_varint_num(&mut buf, method_bytes.len() as i64);
     buf.extend_from_slice(method_bytes);
 
-    if !path.is_empty() {
+    if path.is_empty() {
+        write_varint_num(&mut buf, -1);
+    } else {
         let path_bytes = path.as_bytes();
         write_varint_num(&mut buf, path_bytes.len() as i64);
         buf.extend_from_slice(path_bytes);
-    } else {
-        write_varint_num(&mut buf, -1);
     }
 
-    if !query.is_empty() {
+    if query.is_empty() {
+        write_varint_num(&mut buf, -1);
+    } else {
         let query_bytes = query.as_bytes();
         write_varint_num(&mut buf, query_bytes.len() as i64);
         buf.extend_from_slice(query_bytes);
-    } else {
-        write_varint_num(&mut buf, -1);
     }
 
     write_varint_num(&mut buf, headers.len() as i64);
@@ -144,6 +159,7 @@ pub fn serialize_request_payload(
 }
 
 /// Serialize a response payload for BRC-31 signature verification.
+#[must_use]
 pub fn serialize_response_payload(
     request_nonce: &[u8],
     status_code: u16,
@@ -153,7 +169,7 @@ pub fn serialize_response_payload(
     let mut buf = Vec::new();
     buf.extend_from_slice(request_nonce);
 
-    write_varint_num(&mut buf, status_code as i64);
+    write_varint_num(&mut buf, i64::from(status_code));
 
     write_varint_num(&mut buf, headers.len() as i64);
     for (key, value) in headers {
@@ -183,6 +199,7 @@ pub fn serialize_response_payload(
 // ---------------------------------------------------------------------------
 
 /// Extract headers from an `http::HeaderMap` as `(String, String)` pairs.
+#[must_use]
 pub fn headers_from_map(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
@@ -191,6 +208,7 @@ pub fn headers_from_map(headers: &HeaderMap) -> Vec<(String, String)> {
 }
 
 /// Serialize a response payload from status code, headers, and body bytes.
+#[must_use]
 pub fn serialize_from_http_response(
     request_nonce: &[u8],
     status: StatusCode,
@@ -219,7 +237,10 @@ mod tests {
     fn test_varint_negative_writes_twos_complement_u64() {
         let mut buf = Vec::new();
         write_varint_num(&mut buf, -1);
-        assert_eq!(buf, vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(
+            buf,
+            vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
     }
 
     #[test]
@@ -258,7 +279,10 @@ mod tests {
 
     #[test]
     fn test_request_headers_include_content_type_normalized() {
-        let headers = vec![("Content-Type".to_string(), "application/json; charset=utf-8".to_string())];
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        )];
         let result = filter_and_sort_request_headers(&headers);
         assert_eq!(result[0].1, "application/json");
     }

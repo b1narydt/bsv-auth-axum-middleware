@@ -3,7 +3,7 @@
 //! Implements the tower `Layer`/`Service` pattern to intercept all
 //! requests and handle three branches:
 //!
-//! 1. **Handshake** (`/.well-known/auth`) -- feed incoming AuthMessage to Peer,
+//! 1. **Handshake** (`/.well-known/auth`) -- feed incoming `AuthMessage` to Peer,
 //!    wait for signed response, return with `x-bsv-auth-*` headers.
 //! 2. **Authenticated** (requests with `x-bsv-auth-*` headers) -- verify
 //!    request signature via Peer, call handler, buffer response, sign response.
@@ -32,7 +32,7 @@ use crate::error::AuthMiddlewareError;
 use crate::extractor::Authenticated;
 use crate::helpers::{build_auth_message, extract_auth_headers};
 use crate::payload::headers_from_map;
-use crate::transport::ActixTransport;
+use crate::transport::AxumTransport;
 
 // ---------------------------------------------------------------------------
 // AuthLayer (tower Layer)
@@ -44,7 +44,7 @@ use crate::transport::ActixTransport;
 #[derive(Clone)]
 pub struct AuthLayer<W: WalletInterface> {
     peer: Arc<tokio::sync::Mutex<Peer<W>>>,
-    transport: Arc<ActixTransport>,
+    transport: Arc<AxumTransport>,
     allow_unauthenticated: bool,
     certificate_gate: Option<CertificateGate>,
 }
@@ -58,7 +58,7 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
     /// * `allow_unauthenticated` - Whether to allow requests without auth headers.
     pub fn new(
         peer: Arc<tokio::sync::Mutex<Peer<W>>>,
-        transport: Arc<ActixTransport>,
+        transport: Arc<AxumTransport>,
         allow_unauthenticated: bool,
     ) -> Self {
         Self {
@@ -70,6 +70,7 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
     }
 
     /// Set a certificate gate for per-identity request gating.
+    #[must_use]
     pub fn with_certificate_gate(mut self, gate: CertificateGate) -> Self {
         self.certificate_gate = Some(gate);
         self
@@ -102,7 +103,7 @@ where
 pub struct AuthService<S, W: WalletInterface> {
     inner: S,
     peer: Arc<tokio::sync::Mutex<Peer<W>>>,
-    transport: Arc<ActixTransport>,
+    transport: Arc<AxumTransport>,
     allow_unauthenticated: bool,
     certificate_gate: Option<CertificateGate>,
 }
@@ -123,6 +124,13 @@ where
         self.inner.poll_ready(cx)
     }
 
+    // The three-branch request dispatch (handshake / authenticated / unauthenticated)
+    // plus body buffering and response signing naturally exceeds the pedantic
+    // 100-line limit. Splitting it would obscure the control flow rather than
+    // clarify it — each branch is a cohesive unit of the BRC-31 protocol state
+    // machine and splitting on branch boundaries would require passing the
+    // entire request context through helper signatures.
+    #[allow(clippy::too_many_lines)]
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let mut inner = self.inner.clone();
         let peer = self.peer.clone();
@@ -155,12 +163,16 @@ where
                     let body_bytes = body
                         .collect()
                         .await
-                        .map(|c| c.to_bytes())
+                        .map(http_body_util::Collected::to_bytes)
                         .unwrap_or_default();
 
                     // 2. Build AuthMessage from request
                     let raw_headers = headers_from_map(&parts.headers);
-                    let query = parts.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+                    let query = parts
+                        .uri
+                        .query()
+                        .map(|q| format!("?{q}"))
+                        .unwrap_or_default();
                     let auth_msg = build_auth_message(
                         parts.method.as_str(),
                         parts.uri.path(),
@@ -255,7 +267,7 @@ where
 async fn handle_handshake<W>(
     req: Request<Body>,
     peer: Arc<tokio::sync::Mutex<Peer<W>>>,
-    transport: Arc<ActixTransport>,
+    transport: Arc<AxumTransport>,
 ) -> Response<Body>
 where
     W: WalletInterface + 'static,
@@ -336,7 +348,10 @@ where
         }
     };
 
-    debug!("Handshake response ready: identity_key={}", response_msg.identity_key);
+    debug!(
+        "Handshake response ready: identity_key={}",
+        response_msg.identity_key
+    );
 
     // Build response with auth headers
     let resp_json = serde_json::to_vec(&response_msg).unwrap_or_default();
@@ -378,12 +393,11 @@ where
     // 1. Buffer the response
     let status = service_resp.status();
     let response_headers = service_resp.headers().clone();
-    let body_bytes = match service_resp.into_body().collect().await {
-        Ok(c) => c.to_bytes().to_vec(),
-        Err(_) => {
-            error!("Failed to buffer response body for signing");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+    let body_bytes = if let Ok(c) = service_resp.into_body().collect().await {
+        c.to_bytes().to_vec()
+    } else {
+        error!("Failed to buffer response body for signing");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
 
     // 2. Serialize response payload
@@ -397,7 +411,15 @@ where
         &body_bytes,
     );
 
-    // 3. Sign via Peer
+    // 3. Sign the response against the exact session that authenticated the
+    //    request. The incoming your_nonce is our session nonce, so this stays
+    //    request-safe even when the same identity has multiple active sessions.
+    //    (See bsv-rust-sdk Peer::create_general_message — its first arg accepts
+    //    either identity key or session nonce; passing the nonce binds the
+    //    signature to the exact session that handled this request, whereas
+    //    identity-key lookup would non-deterministically pick "some" session
+    //    from the identity_to_nonces map. Resolved by bsv-parity Phase 1
+    //    investigation, 2026-04-11. See .planning/bsv-parity-FINDING-your-nonce.md.)
     let signed_msg = {
         let peer_guard = peer.lock().await;
         match peer_guard
@@ -412,12 +434,15 @@ where
         }
     };
 
-    debug!("Response signed for identity_key={}", signed_msg.identity_key);
+    debug!(
+        "Response signed for identity_key={}",
+        signed_msg.identity_key
+    );
 
     // 4. Rebuild response with original headers + auth headers
     let mut builder = Response::builder().status(status);
 
-    for (key, value) in response_headers.iter() {
+    for (key, value) in &response_headers {
         builder = builder.header(key, value);
     }
 

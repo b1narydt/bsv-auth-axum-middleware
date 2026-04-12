@@ -1,6 +1,6 @@
-//! Channel-based Transport implementation for Actix-web middleware.
+//! Channel-based Transport implementation for axum middleware.
 //!
-//! `ActixTransport` implements the BSV SDK `Transport` trait using tokio
+//! `AxumTransport` implements the BSV SDK `Transport` trait using tokio
 //! channels for message passing. Oneshot channels provide per-request
 //! message correlation (replacing the TS callback map pattern), and an
 //! mpsc channel feeds incoming messages to the `Peer`.
@@ -17,30 +17,31 @@ use bsv::auth::types::AuthMessage;
 
 use crate::error::AuthMiddlewareError;
 
-/// Channel-based transport bridging Actix-web requests and the BSV SDK Peer.
+/// Channel-based transport bridging axum requests and the BSV SDK Peer.
 ///
 /// Stores a map of pending oneshot senders keyed by nonce for per-request
 /// message correlation. The `subscribe()` method returns an mpsc receiver
 /// for the Peer to consume incoming messages.
-pub struct ActixTransport {
-    /// Pending response senders keyed by nonce/request_id.
+pub struct AxumTransport {
+    /// Pending response senders keyed by `nonce/request_id`.
     pending: Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<AuthMessage>>>>,
     /// Sender for feeding incoming messages to the Peer's subscription channel.
     incoming_tx: mpsc::Sender<AuthMessage>,
     /// Receiver taken once by the Peer via `subscribe()`.
-    /// Uses std::sync::Mutex because `subscribe()` is a sync fn that may be
-    /// called from within an async runtime (Peer::new calls it).
+    /// Uses `std::sync::Mutex` because `subscribe()` is a sync fn that may be
+    /// called from within an async runtime (`Peer::new` calls it).
     incoming_rx: std::sync::Mutex<Option<mpsc::Receiver<AuthMessage>>>,
 }
 
-impl Default for ActixTransport {
+impl Default for AxumTransport {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ActixTransport {
+impl AxumTransport {
     /// Create a new transport with an internal mpsc channel.
+    #[must_use]
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel(1024);
         Self {
@@ -59,15 +60,21 @@ impl ActixTransport {
     }
 
     /// Feed an incoming auth message to the Peer's subscription channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthMiddlewareError::Transport`] if the incoming channel has
+    /// been closed — typically because the subscriber (the `Peer` internals)
+    /// dropped the receiver side before the middleware could feed a message.
     pub async fn feed_incoming(&self, message: AuthMessage) -> Result<(), AuthMiddlewareError> {
         self.incoming_tx.send(message).await.map_err(|e| {
-            AuthMiddlewareError::Transport(format!("failed to send incoming message: {}", e))
+            AuthMiddlewareError::Transport(format!("failed to send incoming message: {e}"))
         })
     }
 }
 
 #[async_trait]
-impl Transport for ActixTransport {
+impl Transport for AxumTransport {
     async fn send(&self, message: AuthMessage) -> Result<(), AuthError> {
         // Extract the correlation key from the message.
         // The Peer sets your_nonce on outgoing messages to correlate with the
@@ -84,7 +91,7 @@ impl Transport for ActixTransport {
             .to_string();
 
         let sender = self.pending.lock().await.remove(&key).ok_or_else(|| {
-            AuthError::TransportError(format!("no pending request for nonce: {}", key))
+            AuthError::TransportError(format!("no pending request for nonce: {key}"))
         })?;
 
         // Deliver the message. If the receiver was dropped, ignore the error.
@@ -307,14 +314,14 @@ mod tests {
         }
     }
 
-    /// Helper: create a minimal AuthMessage with given your_nonce.
+    /// Helper: create a minimal `AuthMessage` with given `your_nonce`.
     fn make_message(your_nonce: Option<&str>) -> AuthMessage {
         AuthMessage {
             version: "0.1".to_string(),
             message_type: MessageType::General,
             identity_key: "test-key".to_string(),
             nonce: Some("my-nonce".to_string()),
-            your_nonce: your_nonce.map(|s| s.to_string()),
+            your_nonce: your_nonce.map(std::string::ToString::to_string),
             initial_nonce: None,
             certificates: None,
             requested_certificates: None,
@@ -325,7 +332,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transport_send_subscribe() {
-        let transport = ActixTransport::new();
+        let transport = AxumTransport::new();
         let mut rx = transport.subscribe();
 
         let msg = make_message(None);
@@ -337,7 +344,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_oneshot_correlation() {
-        let transport = ActixTransport::new();
+        let transport = AxumTransport::new();
         let oneshot_rx = transport.register_pending("nonce1".to_string()).await;
 
         let msg = make_message(Some("nonce1"));
@@ -349,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_no_pending() {
-        let transport = ActixTransport::new();
+        let transport = AxumTransport::new();
         let msg = make_message(Some("unknown-nonce"));
         let result = transport.send(msg).await;
         assert!(result.is_err());
@@ -358,14 +365,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "subscribe() can only be called once")]
     fn test_subscribe_once() {
-        let transport = ActixTransport::new();
+        let transport = AxumTransport::new();
         let _rx1 = transport.subscribe();
         let _rx2 = transport.subscribe(); // should panic
     }
 
     #[tokio::test]
     async fn test_peer_shared_state() {
-        let transport = Arc::new(ActixTransport::new());
+        let transport = Arc::new(AxumTransport::new());
         let peer = Peer::new(MockWallet, transport.clone());
         let shared_peer = Arc::new(tokio::sync::Mutex::new(peer));
 
@@ -382,7 +389,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_no_nonce_returns_error() {
-        let transport = ActixTransport::new();
+        let transport = AxumTransport::new();
         // Message with no your_nonce and no initial_nonce
         let msg = AuthMessage {
             version: "0.1".to_string(),

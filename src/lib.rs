@@ -34,4 +34,4 @@ pub use error::AuthMiddlewareError;
 pub use extractor::Authenticated;
 pub use helpers::{extract_auth_headers, AuthHeaders};
 pub use middleware::{AuthLayer, AuthService};
-pub use transport::ActixTransport;
+pub use transport::AxumTransport;

@@ -22,7 +22,10 @@ pub type OnCertificatesReceived =
 
 impl<W: WalletInterface> std::fmt::Debug for AuthMiddlewareConfig<W> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `wallet` is elided because `W: WalletInterface` does not require `Debug`;
+        // presence of the remaining optional fields is reported instead of their contents.
         f.debug_struct("AuthMiddlewareConfig")
+            .field("wallet", &"<W: WalletInterface>")
             .field("allow_unauthenticated", &self.allow_unauthenticated)
             .field(
                 "certificates_to_request",
@@ -40,7 +43,7 @@ impl<W: WalletInterface> std::fmt::Debug for AuthMiddlewareConfig<W> {
 /// Configuration for the BSV authentication middleware.
 ///
 /// Generic over `W: WalletInterface` for zero-cost static dispatch.
-/// WalletInterface uses `#[async_trait]` and is object-safe, but generics
+/// `WalletInterface` uses `#[async_trait]` and is object-safe, but generics
 /// are preferred to avoid dynamic dispatch overhead.
 pub struct AuthMiddlewareConfig<W: WalletInterface> {
     /// The wallet implementation used for authentication operations.
@@ -78,6 +81,7 @@ impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
     /// - `allow_unauthenticated`: false
     /// - `certificates_to_request`: None
     /// - `session_manager`: None
+    #[must_use]
     pub fn new() -> Self {
         Self {
             wallet: None,
@@ -89,30 +93,35 @@ impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
     }
 
     /// Set the wallet implementation (required).
+    #[must_use]
     pub fn wallet(mut self, wallet: W) -> Self {
         self.wallet = Some(wallet);
         self
     }
 
     /// Set whether unauthenticated requests are allowed through.
+    #[must_use]
     pub fn allow_unauthenticated(mut self, value: bool) -> Self {
         self.allow_unauthenticated = value;
         self
     }
 
     /// Set the certificates to request from peers.
+    #[must_use]
     pub fn certificates_to_request(mut self, certs: RequestedCertificateSet) -> Self {
         self.certificates_to_request = Some(certs);
         self
     }
 
     /// Set the session manager.
+    #[must_use]
     pub fn session_manager(mut self, manager: SessionManager) -> Self {
         self.session_manager = Some(manager);
         self
     }
 
     /// Set the callback invoked when certificates are received from a peer.
+    #[must_use]
     pub fn on_certificates_received(mut self, cb: OnCertificatesReceived) -> Self {
         self.on_certificates_received = Some(Arc::new(cb));
         self
@@ -120,7 +129,10 @@ impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
 
     /// Build the configuration.
     ///
-    /// Returns `AuthMiddlewareError::Config` if the wallet has not been set.
+    /// # Errors
+    ///
+    /// Returns [`AuthMiddlewareError::Config`] if the wallet has not been set
+    /// via [`Self::wallet`] before calling `build`.
     pub fn build(self) -> Result<AuthMiddlewareConfig<W>, AuthMiddlewareError> {
         let wallet = self
             .wallet
@@ -399,7 +411,7 @@ mod tests {
             AuthMiddlewareError::Config(msg) => {
                 assert_eq!(msg, "wallet is required");
             }
-            _ => panic!("expected Config error, got: {:?}", err),
+            _ => panic!("expected Config error, got: {err:?}"),
         }
     }
 
@@ -425,7 +437,9 @@ mod tests {
     #[test]
     fn test_certificates_to_request_can_be_set() {
         let mut certs = RequestedCertificateSet::default();
-        certs.types.insert("certifier1".to_string(), vec!["field1".to_string()]);
+        certs
+            .types
+            .insert("certifier1".to_string(), vec!["field1".to_string()]);
 
         let config = AuthMiddlewareConfigBuilder::new()
             .wallet(MockWallet)

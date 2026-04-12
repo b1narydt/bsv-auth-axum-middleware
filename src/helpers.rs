@@ -1,6 +1,6 @@
 //! Helper functions for the BRC-31 auth middleware.
 //!
-//! Provides header extraction, body reading, and AuthMessage construction
+//! Provides header extraction, body reading, and `AuthMessage` construction
 //! utilities that the middleware will call.
 
 use axum::http::HeaderMap;
@@ -29,6 +29,7 @@ pub struct AuthHeaders {
 ///
 /// Returns `None` if ANY of the six headers is missing or contains
 /// non-ASCII characters.
+#[must_use]
 pub fn extract_auth_headers(headers: &HeaderMap) -> Option<AuthHeaders> {
     let version = headers
         .get("x-bsv-auth-version")?
@@ -40,11 +41,7 @@ pub fn extract_auth_headers(headers: &HeaderMap) -> Option<AuthHeaders> {
         .to_str()
         .ok()?
         .to_string();
-    let nonce = headers
-        .get("x-bsv-auth-nonce")?
-        .to_str()
-        .ok()?
-        .to_string();
+    let nonce = headers.get("x-bsv-auth-nonce")?.to_str().ok()?.to_string();
     let your_nonce = headers
         .get("x-bsv-auth-your-nonce")?
         .to_str()
