@@ -103,9 +103,11 @@ impl ActixTransport {
     pub async fn register_pending(&self, nonce: String) -> oneshot::Receiver<AuthMessage> {
         let (tx, rx) = oneshot::channel();
 
-        // Spawn the timeout task. It removes its own entry on fire (guarded
-        // by a pointer-equality check on the abort handle so it doesn't
-        // evict a freshly re-registered entry).
+        // Spawn the timeout task. The abort-before-unlock ordering in
+        // register_pending (abort called while the pending-map mutex is still
+        // held, before inserting the new entry) ensures this task can never
+        // remove a freshly re-registered entry for the same key: a sleeping
+        // tokio task will never wake after `abort()`.
         let pending = self.pending.clone();
         let key = nonce.clone();
         let timeout_duration = self.pending_timeout;
