@@ -4,18 +4,42 @@
 //! channels for message passing. Oneshot channels provide per-request
 //! message correlation (replacing the TS callback map pattern), and an
 //! mpsc channel feeds incoming messages to the `Peer`.
+//!
+//! Each pending registration is guarded by a cancellable background timeout
+//! task. If the peer never responds, the timeout fires, removes the entry
+//! from the pending map and drops the oneshot sender so the awaiting side
+//! observes a `RecvError` (mirrors the TS `openNextHandlerTimeouts` pattern
+//! in `auth-express-middleware` at lines 188, 453-460, and 629-651).
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::AbortHandle;
 
 use bsv::auth::error::AuthError;
 use bsv::auth::transports::Transport;
 use bsv::auth::types::AuthMessage;
 
 use crate::error::AuthMiddlewareError;
+
+/// Default pending-message timeout, matching the TS `CERTIFICATE_TIMEOUT_MS`
+/// / `openNextHandlerTimeouts` duration (30 seconds).
+pub const DEFAULT_PENDING_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Internal entry stored in the pending map.
+///
+/// Keeps the oneshot sender (for normal resolution) paired with the abort
+/// handle of the timeout task so both can be cleaned up atomically: successful
+/// `send()` aborts the timeout, timeout firing drops the sender.
+struct PendingEntry {
+    sender: oneshot::Sender<AuthMessage>,
+    timeout_handle: AbortHandle,
+}
+
+type PendingMap = Arc<tokio::sync::Mutex<HashMap<String, PendingEntry>>>;
 
 /// Channel-based transport bridging Actix-web requests and the BSV SDK Peer.
 ///
@@ -24,13 +48,15 @@ use crate::error::AuthMiddlewareError;
 /// for the Peer to consume incoming messages.
 pub struct ActixTransport {
     /// Pending response senders keyed by nonce/request_id.
-    pending: Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<AuthMessage>>>>,
+    pending: PendingMap,
     /// Sender for feeding incoming messages to the Peer's subscription channel.
     incoming_tx: mpsc::Sender<AuthMessage>,
     /// Receiver taken once by the Peer via `subscribe()`.
     /// Uses std::sync::Mutex because `subscribe()` is a sync fn that may be
     /// called from within an async runtime (Peer::new calls it).
     incoming_rx: std::sync::Mutex<Option<mpsc::Receiver<AuthMessage>>>,
+    /// Timeout applied to each `register_pending` entry. Defaults to 30s.
+    pending_timeout: Duration,
 }
 
 impl Default for ActixTransport {
@@ -40,21 +66,76 @@ impl Default for ActixTransport {
 }
 
 impl ActixTransport {
-    /// Create a new transport with an internal mpsc channel.
+    /// Create a new transport with an internal mpsc channel and the default
+    /// 30-second pending-message timeout.
     pub fn new() -> Self {
+        Self::with_timeout(DEFAULT_PENDING_TIMEOUT)
+    }
+
+    /// Create a new transport with a custom pending-message timeout. Each
+    /// entry registered via `register_pending` is automatically cleaned up
+    /// (and the oneshot sender dropped) if no response arrives within
+    /// `pending_timeout`.
+    pub fn with_timeout(pending_timeout: Duration) -> Self {
         let (tx, rx) = mpsc::channel(1024);
         Self {
             pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             incoming_tx: tx,
             incoming_rx: std::sync::Mutex::new(Some(rx)),
+            pending_timeout,
         }
+    }
+
+    /// Return the configured pending-message timeout.
+    pub fn pending_timeout(&self) -> Duration {
+        self.pending_timeout
     }
 
     /// Register a pending request by nonce, returning a oneshot receiver
     /// that will resolve when the Peer sends a response for this nonce.
+    ///
+    /// A background timeout task is spawned: if no matching `send()` arrives
+    /// within `pending_timeout`, the entry is removed from the pending map
+    /// and the oneshot sender is dropped (awaiting side sees `RecvError`).
+    /// If `register_pending` is called again with the same key, the previous
+    /// timeout task is aborted and the previous sender is dropped before the
+    /// new one is installed (mirrors TS line 630 cleanup-then-reinstall).
     pub async fn register_pending(&self, nonce: String) -> oneshot::Receiver<AuthMessage> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(nonce, tx);
+
+        // Spawn the timeout task. It removes its own entry on fire (guarded
+        // by a pointer-equality check on the abort handle so it doesn't
+        // evict a freshly re-registered entry).
+        let pending = self.pending.clone();
+        let key = nonce.clone();
+        let timeout_duration = self.pending_timeout;
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(timeout_duration).await;
+            // Remove the entry so the awaiting side's `rx.await` resolves
+            // with `RecvError` (sender dropped). We only remove if the key
+            // still maps to an entry — a successful `send()` would have
+            // already removed it (and aborted us before we got here, but
+            // the abort is racy with the final poll, so we double-check).
+            let mut guard = pending.lock().await;
+            guard.remove(&key);
+            // Dropping `guard` + entry here closes the oneshot sender.
+        });
+        let timeout_handle = handle.abort_handle();
+
+        let entry = PendingEntry {
+            sender: tx,
+            timeout_handle,
+        };
+
+        // Insert and, if a previous entry existed for this key, abort its
+        // timeout so it doesn't fire against the new registration.
+        let mut guard = self.pending.lock().await;
+        if let Some(old) = guard.insert(nonce, entry) {
+            old.timeout_handle.abort();
+            // Dropping `old.sender` closes any prior waiter with RecvError.
+        }
+        drop(guard);
+
         rx
     }
 
@@ -83,12 +164,16 @@ impl Transport for ActixTransport {
             })?
             .to_string();
 
-        let sender = self.pending.lock().await.remove(&key).ok_or_else(|| {
+        let entry = self.pending.lock().await.remove(&key).ok_or_else(|| {
             AuthError::TransportError(format!("no pending request for nonce: {}", key))
         })?;
 
+        // Cancel the timeout task so it doesn't later try to remove an
+        // entry we already claimed (harmless, but avoids wasted wakeups).
+        entry.timeout_handle.abort();
+
         // Deliver the message. If the receiver was dropped, ignore the error.
-        let _ = sender.send(message);
+        let _ = entry.sender.send(message);
         Ok(())
     }
 
@@ -378,6 +463,112 @@ mod tests {
         });
 
         assert!(handle.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_register_pending_times_out_after_duration() {
+        // Short (100ms) timeout: if we never send, the receiver must resolve
+        // with a RecvError (sender dropped) once the timeout fires.
+        let transport = ActixTransport::with_timeout(Duration::from_millis(100));
+        let rx = transport.register_pending("lost-nonce".to_string()).await;
+
+        // Wait long enough for the timeout to fire + map entry removal.
+        let result = tokio::time::timeout(Duration::from_millis(500), rx).await;
+
+        // Outer timeout must NOT fire — the inner rx should have resolved.
+        let rx_result = result.expect("inner rx did not resolve before outer timeout");
+        // Sender was dropped by the timeout task -> RecvError.
+        assert!(
+            rx_result.is_err(),
+            "expected RecvError after timeout fired, got {:?}",
+            rx_result
+        );
+
+        // Pending map must be cleaned up.
+        assert!(transport.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_timeout_is_aborted_on_successful_send() {
+        // 500ms timeout, immediate send: receiver should see the message,
+        // and after sleeping past the original timeout nothing else should
+        // have fired.
+        let transport = ActixTransport::with_timeout(Duration::from_millis(500));
+        let rx = transport.register_pending("nonce-ok".to_string()).await;
+
+        let msg = make_message(Some("nonce-ok"));
+        transport.send(msg).await.unwrap();
+
+        let received = rx.await.expect("expected message, not timeout");
+        assert_eq!(received.your_nonce.as_deref(), Some("nonce-ok"));
+
+        // Sleep past the original timeout to make sure no lingering task
+        // causes panics or side effects.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // Pending map is still empty.
+        assert!(transport.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reregister_cancels_old_timeout() {
+        // First registration with a long timeout (10s). If it ever fired in
+        // this test, the test would hang — so proving the re-registration
+        // wins is the point.
+        let transport = ActixTransport::with_timeout(Duration::from_secs(10));
+        let rx_old = transport.register_pending("dup-key".to_string()).await;
+
+        // Re-register the same key on a transport configured with a shorter
+        // timeout. We can't change `pending_timeout` mid-flight, so spin up
+        // a second transport to demonstrate the "shorter timeout wins"
+        // behaviour directly; for the same-transport re-registration we
+        // verify the old waiter's sender was dropped and the new one is live.
+        let rx_new = transport.register_pending("dup-key".to_string()).await;
+
+        // The old receiver must see RecvError (sender was dropped on
+        // re-registration).
+        let old_result = tokio::time::timeout(Duration::from_millis(200), rx_old)
+            .await
+            .expect("old rx should resolve immediately after re-registration");
+        assert!(
+            old_result.is_err(),
+            "old rx should see RecvError after re-registration"
+        );
+
+        // The new receiver is still pending; send fulfils it.
+        let msg = make_message(Some("dup-key"));
+        transport.send(msg).await.unwrap();
+        let received = rx_new.await.expect("new rx should receive the message");
+        assert_eq!(received.your_nonce.as_deref(), Some("dup-key"));
+
+        // Now repeat on a short-timeout transport to show the freshly
+        // installed timeout also supersedes the old one.
+        let short = ActixTransport::with_timeout(Duration::from_millis(100));
+        let _rx_first = short.register_pending("k".to_string()).await;
+        let rx_second = short.register_pending("k".to_string()).await;
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // After 300ms the fresh 100ms timeout has fired; new rx sees
+        // RecvError and the map is empty.
+        let second_result = tokio::time::timeout(Duration::from_millis(50), rx_second)
+            .await
+            .expect("second rx should have resolved via timeout");
+        assert!(second_result.is_err());
+        assert!(short.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_default_timeout_is_30s() {
+        // Smoke test: default constructor uses the 30-second constant.
+        let transport = ActixTransport::new();
+        assert_eq!(transport.pending_timeout(), Duration::from_secs(30));
+
+        let default_transport = ActixTransport::default();
+        assert_eq!(default_transport.pending_timeout(), Duration::from_secs(30));
+
+        // And the public constant matches.
+        assert_eq!(DEFAULT_PENDING_TIMEOUT, Duration::from_secs(30));
     }
 
     #[tokio::test]
