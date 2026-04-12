@@ -260,15 +260,7 @@ where
                                 .is_err()
                             {
                                 warn!(identity_key = %headers.identity_key, "certificate request timed out");
-                                return Ok((
-                                    StatusCode::REQUEST_TIMEOUT,
-                                    axum::Json(serde_json::json!({
-                                        "status": "error",
-                                        "code": "CERTIFICATE_TIMEOUT",
-                                        "message": "Certificate request timed out"
-                                    })),
-                                )
-                                    .into_response());
+                                return Ok(AuthMiddlewareError::CertificateTimeout.into_response());
                             }
                         }
                     }
@@ -292,15 +284,7 @@ where
                         inner.call(req).await
                     } else {
                         debug!("No auth headers, rejecting with 401");
-                        Ok((
-                            StatusCode::UNAUTHORIZED,
-                            axum::Json(serde_json::json!({
-                                "status": "error",
-                                "code": "ERR_UNAUTHORIZED",
-                                "description": "Mutual authentication required"
-                            })),
-                        )
-                            .into_response())
+                        Ok(AuthMiddlewareError::Unauthorized.into_response())
                     }
                 }
             }
@@ -467,7 +451,7 @@ where
             Ok(msg) => msg,
             Err(e) => {
                 error!("Response signing failed: {}", e);
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                return AuthMiddlewareError::ResponseSigningFailed(e.to_string()).into_response();
             }
         }
     };
@@ -584,5 +568,43 @@ mod tests {
 
         let layer = AuthLayer::from_config(config, peer, transport).await;
         assert!(layer.certificate_gate.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_request_emits_ts_spec_body() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::body::to_bytes;
+        use axum::routing::get;
+        use http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let transport = Arc::new(ActixTransport::new());
+        let peer = Arc::new(tokio::sync::Mutex::new(Peer::new(MockWallet, transport.clone())));
+
+        let config = AuthMiddlewareConfigBuilder::new()
+            .wallet(MockWallet)
+            .allow_unauthenticated(false)
+            .build()
+            .unwrap();
+        let layer = AuthLayer::from_config(config, peer, transport).await;
+
+        let app = Router::new()
+            .route("/", get(|| async { "hello" }))
+            .layer(layer);
+
+        let req = Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["code"], "UNAUTHORIZED");
+        assert_eq!(json["message"], "Mutual-authentication failed!");
+        assert!(json.get("description").is_none());
     }
 }
