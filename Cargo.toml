@@ -2,15 +2,27 @@
 name = "bsv-auth-axum-middleware"
 version = "0.1.0"
 edition = "2021"
-description = "BSV BRC-31 authentication middleware for axum — ported from bsv-auth-actix-middleware"
-license = "MIT"
+rust-version = "1.88"
+description = "BSV BRC-31 mutual authentication middleware for axum (port of bsv-auth-actix-middleware)"
+license-file = "LICENSE"
+repository = "https://github.com/b1narydt/bsv-auth-axum-middleware"
+homepage = "https://github.com/b1narydt/bsv-auth-axum-middleware"
+readme = "README.md"
+keywords = ["bsv", "authentication", "axum", "brc-31", "middleware"]
+categories = ["web-programming::http-server", "authentication"]
+exclude = ["docs/*"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 name = "bsv_auth_axum_middleware"
 
 [dependencies]
-# BSV SDK — must match the version used by the messagebox server and client
-bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", branch = "main", features = ["network"] }
+# BSV SDK — resolved from crates.io. Downstream consumers (e.g. messagebox)
+# should pin the same major.minor to avoid two-instance trait-bound conflicts.
+bsv-sdk = { version = "0.2", features = ["network"] }
 
 # Axum + tower
 axum = { version = "0.8", features = ["json"] }
@@ -19,25 +31,26 @@ http = "1"
 http-body-util = "0.1"
 
 # Async
-tokio = { version = "1", features = ["sync", "time", "rt"] }
-futures-util = "0.3"
-async-trait = "0.1"
+tokio = { version = "1.51", features = ["sync", "time", "rt"] }
+futures-util = "0.3.32"
+async-trait = "0.1.89"
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-hex = "0.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+hex = "0.4.3"
 base64 = "0.22"
 
 # Error handling
-thiserror = "2"
+thiserror = "2.0"
 
 # Logging
-tracing = "0.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 
 # Certificate gating
-dashmap = "6"
+dashmap = "6.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tokio = { version = "1.51", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }

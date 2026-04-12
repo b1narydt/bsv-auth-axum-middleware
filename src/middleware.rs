@@ -46,7 +46,7 @@ pub struct AuthLayer<W: WalletInterface> {
     peer: Arc<tokio::sync::Mutex<Peer<W>>>,
     transport: Arc<ActixTransport>,
     allow_unauthenticated: bool,
-    certificate_gate: Option<CertificateGate>,
+    pub(crate) certificate_gate: Option<CertificateGate>,
 }
 
 impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
@@ -73,6 +73,68 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
     pub fn with_certificate_gate(mut self, gate: CertificateGate) -> Self {
         self.certificate_gate = Some(gate);
         self
+    }
+
+    /// Create an auth layer from configuration.
+    ///
+    /// When `config.certificates_to_request` is `Some`, this constructor:
+    /// 1. Configures the Peer with the requested certificate set.
+    /// 2. Takes the certificate receivers from the Peer (one-shot take).
+    /// 3. Spawns a background `certificate_listener_task` that consumes
+    ///    certificate events and releases the per-identity gate.
+    pub async fn from_config(
+        config: crate::config::AuthMiddlewareConfig<W>,
+        peer: Arc<tokio::sync::Mutex<Peer<W>>>,
+        transport: Arc<ActixTransport>,
+    ) -> Self {
+        let certificate_gate = if let Some(certs_to_request) =
+            config.certificates_to_request.clone()
+        {
+            let (cert_rx, cert_req_rx) = {
+                let mut peer_guard = peer.lock().await;
+                peer_guard.set_certificates_to_request(certs_to_request);
+                let cert_rx = peer_guard.on_certificates();
+                let cert_req_rx = peer_guard.on_certificate_request();
+
+                if cert_rx.is_none() {
+                    warn!("Peer::on_certificates() returned None -- receiver already taken");
+                }
+                if cert_req_rx.is_none() {
+                    warn!("Peer::on_certificate_request() returned None -- receiver already taken");
+                }
+
+                (cert_rx, cert_req_rx)
+            };
+
+            match (cert_rx, cert_req_rx) {
+                (Some(cert_rx), Some(cert_req_rx)) => {
+                    let gate = crate::certificate::CertificateGate::new();
+                    let gate_clone = gate.clone();
+                    let callback = config.on_certificates_received.clone();
+                    tokio::spawn(crate::certificate::certificate_listener_task(
+                        cert_rx,
+                        cert_req_rx,
+                        gate_clone,
+                        callback,
+                    ));
+                    debug!("certificate listener task spawned");
+                    Some(gate)
+                }
+                _ => {
+                    warn!("certificate exchange configured but receivers unavailable -- gate disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        Self {
+            peer,
+            transport,
+            allow_unauthenticated: config.allow_unauthenticated,
+            certificate_gate,
+        }
     }
 }
 
@@ -160,7 +222,11 @@ where
 
                     // 2. Build AuthMessage from request
                     let raw_headers = headers_from_map(&parts.headers);
-                    let query = parts.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+                    let query = parts
+                        .uri
+                        .query()
+                        .map(|q| format!("?{q}"))
+                        .unwrap_or_default();
                     let auth_msg = build_auth_message(
                         parts.method.as_str(),
                         parts.uri.path(),
@@ -200,15 +266,7 @@ where
                                 .is_err()
                             {
                                 warn!(identity_key = %headers.identity_key, "certificate request timed out");
-                                return Ok((
-                                    StatusCode::REQUEST_TIMEOUT,
-                                    axum::Json(serde_json::json!({
-                                        "status": "error",
-                                        "code": "CERTIFICATE_TIMEOUT",
-                                        "message": "Certificate request timed out"
-                                    })),
-                                )
-                                    .into_response());
+                                return Ok(AuthMiddlewareError::CertificateTimeout.into_response());
                             }
                         }
                     }
@@ -232,15 +290,7 @@ where
                         inner.call(req).await
                     } else {
                         debug!("No auth headers, rejecting with 401");
-                        Ok((
-                            StatusCode::UNAUTHORIZED,
-                            axum::Json(serde_json::json!({
-                                "status": "error",
-                                "code": "ERR_UNAUTHORIZED",
-                                "description": "Mutual authentication required"
-                            })),
-                        )
-                            .into_response())
+                        Ok(AuthMiddlewareError::Unauthorized.into_response())
                     }
                 }
             }
@@ -294,6 +344,30 @@ where
     match auth_msg.message_type {
         bsv::auth::types::MessageType::CertificateResponse
         | bsv::auth::types::MessageType::CertificateRequest => {
+            // GAP G4: if a certificate-response carries no certificates, TS
+            // auth-express-middleware:437-442 short-circuits with 400 and the
+            // minimal body `{"status":"No certificates provided"}` (not the
+            // standard error shape). Mirror that exactly.
+            if matches!(
+                auth_msg.message_type,
+                bsv::auth::types::MessageType::CertificateResponse
+            ) && auth_msg
+                .certificates
+                .as_ref()
+                .map(|c| c.is_empty())
+                .unwrap_or(true)
+            {
+                warn!(
+                    identity_key = %auth_msg.identity_key,
+                    "certificate-response received with empty certs -- rejecting with 400"
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"status": "No certificates provided"})),
+                )
+                    .into_response();
+            }
+
             if let Err(e) = transport.feed_incoming(auth_msg).await {
                 error!("Failed to feed certificate message: {}", e);
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -336,7 +410,10 @@ where
         }
     };
 
-    debug!("Handshake response ready: identity_key={}", response_msg.identity_key);
+    debug!(
+        "Handshake response ready: identity_key={}",
+        response_msg.identity_key
+    );
 
     // Build response with auth headers
     let resp_json = serde_json::to_vec(&response_msg).unwrap_or_default();
@@ -407,12 +484,15 @@ where
             Ok(msg) => msg,
             Err(e) => {
                 error!("Response signing failed: {}", e);
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                return AuthMiddlewareError::ResponseSigningFailed(e.to_string()).into_response();
             }
         }
     };
 
-    debug!("Response signed for identity_key={}", signed_msg.identity_key);
+    debug!(
+        "Response signed for identity_key={}",
+        signed_msg.identity_key
+    );
 
     // 4. Rebuild response with original headers + auth headers
     let mut builder = Response::builder().status(status);
@@ -439,4 +519,292 @@ where
     builder
         .body(Body::from(body_bytes))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AuthMiddlewareConfigBuilder;
+    use bsv::auth::peer::Peer;
+    use bsv::auth::types::RequestedCertificateSet;
+
+    // Minimal MockWallet for middleware tests.
+    // All methods return unimplemented!() since we only test constructor logic.
+    use async_trait::async_trait;
+    use bsv::wallet::error::WalletError;
+    use bsv::wallet::interfaces::*;
+
+    struct MockWallet;
+
+    #[async_trait]
+    impl WalletInterface for MockWallet {
+        async fn create_action(
+            &self,
+            _: CreateActionArgs,
+            _: Option<&str>,
+        ) -> Result<CreateActionResult, WalletError> {
+            unimplemented!()
+        }
+        async fn sign_action(
+            &self,
+            _: SignActionArgs,
+            _: Option<&str>,
+        ) -> Result<SignActionResult, WalletError> {
+            unimplemented!()
+        }
+        async fn abort_action(
+            &self,
+            _: AbortActionArgs,
+            _: Option<&str>,
+        ) -> Result<AbortActionResult, WalletError> {
+            unimplemented!()
+        }
+        async fn list_actions(
+            &self,
+            _: ListActionsArgs,
+            _: Option<&str>,
+        ) -> Result<ListActionsResult, WalletError> {
+            unimplemented!()
+        }
+        async fn internalize_action(
+            &self,
+            _: InternalizeActionArgs,
+            _: Option<&str>,
+        ) -> Result<InternalizeActionResult, WalletError> {
+            unimplemented!()
+        }
+        async fn list_outputs(
+            &self,
+            _: ListOutputsArgs,
+            _: Option<&str>,
+        ) -> Result<ListOutputsResult, WalletError> {
+            unimplemented!()
+        }
+        async fn relinquish_output(
+            &self,
+            _: RelinquishOutputArgs,
+            _: Option<&str>,
+        ) -> Result<RelinquishOutputResult, WalletError> {
+            unimplemented!()
+        }
+        async fn get_public_key(
+            &self,
+            _: GetPublicKeyArgs,
+            _: Option<&str>,
+        ) -> Result<GetPublicKeyResult, WalletError> {
+            unimplemented!()
+        }
+        async fn reveal_counterparty_key_linkage(
+            &self,
+            _: RevealCounterpartyKeyLinkageArgs,
+            _: Option<&str>,
+        ) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> {
+            unimplemented!()
+        }
+        async fn reveal_specific_key_linkage(
+            &self,
+            _: RevealSpecificKeyLinkageArgs,
+            _: Option<&str>,
+        ) -> Result<RevealSpecificKeyLinkageResult, WalletError> {
+            unimplemented!()
+        }
+        async fn encrypt(
+            &self,
+            _: EncryptArgs,
+            _: Option<&str>,
+        ) -> Result<EncryptResult, WalletError> {
+            unimplemented!()
+        }
+        async fn decrypt(
+            &self,
+            _: DecryptArgs,
+            _: Option<&str>,
+        ) -> Result<DecryptResult, WalletError> {
+            unimplemented!()
+        }
+        async fn create_hmac(
+            &self,
+            _: CreateHmacArgs,
+            _: Option<&str>,
+        ) -> Result<CreateHmacResult, WalletError> {
+            unimplemented!()
+        }
+        async fn verify_hmac(
+            &self,
+            _: VerifyHmacArgs,
+            _: Option<&str>,
+        ) -> Result<VerifyHmacResult, WalletError> {
+            unimplemented!()
+        }
+        async fn create_signature(
+            &self,
+            _: CreateSignatureArgs,
+            _: Option<&str>,
+        ) -> Result<CreateSignatureResult, WalletError> {
+            unimplemented!()
+        }
+        async fn verify_signature(
+            &self,
+            _: VerifySignatureArgs,
+            _: Option<&str>,
+        ) -> Result<VerifySignatureResult, WalletError> {
+            unimplemented!()
+        }
+        async fn acquire_certificate(
+            &self,
+            _: AcquireCertificateArgs,
+            _: Option<&str>,
+        ) -> Result<Certificate, WalletError> {
+            unimplemented!()
+        }
+        async fn list_certificates(
+            &self,
+            _: ListCertificatesArgs,
+            _: Option<&str>,
+        ) -> Result<ListCertificatesResult, WalletError> {
+            unimplemented!()
+        }
+        async fn prove_certificate(
+            &self,
+            _: ProveCertificateArgs,
+            _: Option<&str>,
+        ) -> Result<ProveCertificateResult, WalletError> {
+            unimplemented!()
+        }
+        async fn relinquish_certificate(
+            &self,
+            _: RelinquishCertificateArgs,
+            _: Option<&str>,
+        ) -> Result<RelinquishCertificateResult, WalletError> {
+            unimplemented!()
+        }
+        async fn discover_by_identity_key(
+            &self,
+            _: DiscoverByIdentityKeyArgs,
+            _: Option<&str>,
+        ) -> Result<DiscoverCertificatesResult, WalletError> {
+            unimplemented!()
+        }
+        async fn discover_by_attributes(
+            &self,
+            _: DiscoverByAttributesArgs,
+            _: Option<&str>,
+        ) -> Result<DiscoverCertificatesResult, WalletError> {
+            unimplemented!()
+        }
+        async fn is_authenticated(
+            &self,
+            _: Option<&str>,
+        ) -> Result<AuthenticatedResult, WalletError> {
+            unimplemented!()
+        }
+        async fn wait_for_authentication(
+            &self,
+            _: Option<&str>,
+        ) -> Result<AuthenticatedResult, WalletError> {
+            unimplemented!()
+        }
+        async fn get_height(&self, _: Option<&str>) -> Result<GetHeightResult, WalletError> {
+            unimplemented!()
+        }
+        async fn get_header_for_height(
+            &self,
+            _: GetHeaderArgs,
+            _: Option<&str>,
+        ) -> Result<GetHeaderResult, WalletError> {
+            unimplemented!()
+        }
+        async fn get_network(&self, _: Option<&str>) -> Result<GetNetworkResult, WalletError> {
+            unimplemented!()
+        }
+        async fn get_version(&self, _: Option<&str>) -> Result<GetVersionResult, WalletError> {
+            unimplemented!()
+        }
+    }
+
+    // MockWallet must be Clone for Peer<W: Clone> bounds
+    impl Clone for MockWallet {
+        fn clone(&self) -> Self {
+            MockWallet
+        }
+    }
+
+    #[tokio::test]
+    async fn test_from_config_without_certs_has_no_gate() {
+        let transport = Arc::new(ActixTransport::new());
+        let peer = Arc::new(tokio::sync::Mutex::new(Peer::new(
+            MockWallet,
+            transport.clone(),
+        )));
+
+        let config = AuthMiddlewareConfigBuilder::new()
+            .wallet(MockWallet)
+            .allow_unauthenticated(false)
+            .build()
+            .unwrap();
+
+        let layer = AuthLayer::from_config(config, peer, transport).await;
+        assert!(layer.certificate_gate.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_from_config_with_certs_spawns_gate() {
+        let transport = Arc::new(ActixTransport::new());
+        let peer = Arc::new(tokio::sync::Mutex::new(Peer::new(
+            MockWallet,
+            transport.clone(),
+        )));
+
+        let mut certs = RequestedCertificateSet::default();
+        certs
+            .types
+            .insert("certifier1".to_string(), vec!["field1".to_string()]);
+
+        let config = AuthMiddlewareConfigBuilder::new()
+            .wallet(MockWallet)
+            .certificates_to_request(certs)
+            .build()
+            .unwrap();
+
+        let layer = AuthLayer::from_config(config, peer, transport).await;
+        assert!(layer.certificate_gate.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_request_emits_ts_spec_body() {
+        use axum::body::to_bytes;
+        use axum::body::Body;
+        use axum::routing::get;
+        use axum::Router;
+        use http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let transport = Arc::new(ActixTransport::new());
+        let peer = Arc::new(tokio::sync::Mutex::new(Peer::new(
+            MockWallet,
+            transport.clone(),
+        )));
+
+        let config = AuthMiddlewareConfigBuilder::new()
+            .wallet(MockWallet)
+            .allow_unauthenticated(false)
+            .build()
+            .unwrap();
+        let layer = AuthLayer::from_config(config, peer, transport).await;
+
+        let app = Router::new()
+            .route("/", get(|| async { "hello" }))
+            .layer(layer);
+
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["code"], "UNAUTHORIZED");
+        assert_eq!(json["message"], "Mutual-authentication failed!");
+        assert!(json.get("description").is_none());
+    }
 }

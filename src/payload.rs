@@ -219,7 +219,10 @@ mod tests {
     fn test_varint_negative_writes_twos_complement_u64() {
         let mut buf = Vec::new();
         write_varint_num(&mut buf, -1);
-        assert_eq!(buf, vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(
+            buf,
+            vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
     }
 
     #[test]
@@ -258,7 +261,10 @@ mod tests {
 
     #[test]
     fn test_request_headers_include_content_type_normalized() {
-        let headers = vec![("Content-Type".to_string(), "application/json; charset=utf-8".to_string())];
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        )];
         let result = filter_and_sort_request_headers(&headers);
         assert_eq!(result[0].1, "application/json");
     }
