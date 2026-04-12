@@ -10,7 +10,7 @@ name = "bsv_auth_axum_middleware"
 
 [dependencies]
 # BSV SDK — must match the version used by the messagebox server and client
-bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", branch = "main", features = ["network"] }
+bsv-sdk = { version = "0.2", features = ["network"] }
 
 # Axum + tower
 axum = { version = "0.8", features = ["json"] }
