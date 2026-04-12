@@ -120,6 +120,7 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -132,8 +133,6 @@ dependencies = [
 [[package]]
 name = "bsv-sdk"
 version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1b49c3ed943d8492fb8f495945cdd56c1fe4e86c05d96d7535dad77bbd62257"
 dependencies = [
  "async-trait",
  "futures-util",
