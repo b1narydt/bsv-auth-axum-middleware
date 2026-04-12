@@ -15,7 +15,7 @@ BRC-31 mutual authentication middleware for axum, ported from [b1narydt/auth-act
 
 ## Usage
 
-```rust
+```rust,ignore
 use std::sync::Arc;
 use axum::{Router, routing::post, response::IntoResponse};
 use bsv::auth::peer::Peer;
