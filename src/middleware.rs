@@ -32,7 +32,7 @@ use crate::error::AuthMiddlewareError;
 use crate::extractor::Authenticated;
 use crate::helpers::{build_auth_message, extract_auth_headers};
 use crate::payload::headers_from_map;
-use crate::transport::ActixTransport;
+use crate::transport::AxumTransport;
 
 // ---------------------------------------------------------------------------
 // AuthLayer (tower Layer)
@@ -44,7 +44,7 @@ use crate::transport::ActixTransport;
 #[derive(Clone)]
 pub struct AuthLayer<W: WalletInterface> {
     peer: Arc<tokio::sync::Mutex<Peer<W>>>,
-    transport: Arc<ActixTransport>,
+    transport: Arc<AxumTransport>,
     allow_unauthenticated: bool,
     certificate_gate: Option<CertificateGate>,
 }
@@ -58,7 +58,7 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
     /// * `allow_unauthenticated` - Whether to allow requests without auth headers.
     pub fn new(
         peer: Arc<tokio::sync::Mutex<Peer<W>>>,
-        transport: Arc<ActixTransport>,
+        transport: Arc<AxumTransport>,
         allow_unauthenticated: bool,
     ) -> Self {
         Self {
@@ -103,7 +103,7 @@ where
 pub struct AuthService<S, W: WalletInterface> {
     inner: S,
     peer: Arc<tokio::sync::Mutex<Peer<W>>>,
-    transport: Arc<ActixTransport>,
+    transport: Arc<AxumTransport>,
     allow_unauthenticated: bool,
     certificate_gate: Option<CertificateGate>,
 }
@@ -267,7 +267,7 @@ where
 async fn handle_handshake<W>(
     req: Request<Body>,
     peer: Arc<tokio::sync::Mutex<Peer<W>>>,
-    transport: Arc<ActixTransport>,
+    transport: Arc<AxumTransport>,
 ) -> Response<Body>
 where
     W: WalletInterface + 'static,

@@ -6,7 +6,7 @@
 //! leak into another.
 //!
 //! The server owns a single `AuthLayer<TestWallet>` wrapped around a small
-//! `Router` of handlers that mirror the shapes the sibling actix test suite
+//! `Router` of handlers that mirror the shapes the sibling actix-middleware test suite
 //! exercises (GET, POST JSON, POST bytes, error-500, query-echo). Handlers
 //! use the `Authenticated` extractor so each request's identity key is
 //! verifiable from the handler.
@@ -56,7 +56,7 @@ use bsv::wallet::interfaces::{
 };
 use bsv::wallet::proto_wallet::ProtoWallet;
 
-use bsv_auth_axum_middleware::transport::ActixTransport;
+use bsv_auth_axum_middleware::transport::AxumTransport;
 use bsv_auth_axum_middleware::{AuthLayer, Authenticated};
 
 // ---------------------------------------------------------------------------
@@ -370,7 +370,7 @@ pub async fn spawn_test_server(config: TestServerConfig) -> TestServer {
     let server_wallet = TestWallet::new(server_key);
 
     // Build transport + peer pair.
-    let transport = Arc::new(ActixTransport::new());
+    let transport = Arc::new(AxumTransport::new());
     let peer = Arc::new(Mutex::new(Peer::new(
         server_wallet.clone(),
         transport.clone(),
