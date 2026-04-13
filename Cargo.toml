@@ -1,6 +1,6 @@
 [package]
 name = "bsv-auth-axum-middleware"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.88"
 description = "BSV BRC-31 mutual authentication middleware for axum (port of bsv-auth-actix-middleware)"
