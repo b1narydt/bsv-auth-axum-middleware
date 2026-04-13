@@ -24,8 +24,68 @@ use tracing::{debug, error, warn};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use bsv::auth::peer::Peer;
-use bsv::auth::types::AuthMessage;
+use bsv::auth::types::{AuthMessage, MessageType};
 use bsv::wallet::interfaces::WalletInterface;
+
+/// Map a `MessageType` to the literal string value emitted in the
+/// `x-bsv-auth-message-type` response header. Mirrors the TS
+/// `@bsv/sdk` serde rename values used by `ExpressTransport.send()`
+/// (auth-express-middleware/src/index.ts:263).
+fn message_type_header_value(mt: &MessageType) -> &'static str {
+    match mt {
+        MessageType::InitialRequest => "initialRequest",
+        MessageType::InitialResponse => "initialResponse",
+        MessageType::CertificateRequest => "certificateRequest",
+        MessageType::CertificateResponse => "certificateResponse",
+        MessageType::General => "general",
+    }
+}
+
+/// Build an HTTP response for a non-general signed `AuthMessage`, matching
+/// TS `ExpressTransport.send()` in the non-general branch
+/// (auth-express-middleware/src/index.ts:258-286). Emits the full signed
+/// header set including `x-bsv-auth-message-type` and, when present,
+/// `x-bsv-auth-requested-certificates`.
+fn build_non_general_signed_response(msg: &AuthMessage) -> Response<Body> {
+    let body = serde_json::to_vec(msg).unwrap_or_default();
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .header("x-bsv-auth-version", &msg.version)
+        .header(
+            "x-bsv-auth-message-type",
+            message_type_header_value(&msg.message_type),
+        )
+        .header("x-bsv-auth-identity-key", &msg.identity_key);
+
+    if let Some(ref n) = msg.nonce {
+        builder = builder.header("x-bsv-auth-nonce", n);
+    }
+    if let Some(ref yn) = msg.your_nonce {
+        builder = builder.header("x-bsv-auth-your-nonce", yn);
+    }
+    if let Some(ref sig) = msg.signature {
+        builder = builder.header("x-bsv-auth-signature", hex::encode(sig));
+    }
+    if let Some(ref req_certs) = msg.requested_certificates {
+        match serde_json::to_string(req_certs) {
+            Ok(json) => {
+                builder = builder.header("x-bsv-auth-requested-certificates", json);
+            }
+            Err(e) => {
+                warn!(
+                    "failed to serialise requested_certificates for header: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    builder
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
 
 use crate::certificate::CertificateGate;
 use crate::error::AuthMiddlewareError;
@@ -340,22 +400,29 @@ where
         auth_msg.message_type, auth_msg.identity_key
     );
 
-    // Certificate messages: just process and return 200
+    // Certificate messages: register a pending waiter keyed on the same
+    // correlation nonce the TS `openNonGeneralHandles` uses (initialNonce of
+    // the incoming message — the peer's outgoing signed response sets
+    // `yourNonce` to that same value, see TS Peer.sendCertificateResponse
+    // and ExpressTransport.send at index.ts:253-286). If the Peer produces
+    // a signed outgoing message (e.g. auto-reply to a `certificateRequest`),
+    // we emit the full signed HTTP response with every `x-bsv-auth-*`
+    // header. If the Peer does not (e.g. incoming `certificateResponse`
+    // that only feeds the cert channel), we fall back to the minimal
+    // `{"status":"ok"}` ack after a short timeout — preserving current
+    // behaviour for that path.
     match auth_msg.message_type {
-        bsv::auth::types::MessageType::CertificateResponse
-        | bsv::auth::types::MessageType::CertificateRequest => {
+        MessageType::CertificateResponse | MessageType::CertificateRequest => {
             // GAP G4: if a certificate-response carries no certificates, TS
             // auth-express-middleware:437-442 short-circuits with 400 and the
             // minimal body `{"status":"No certificates provided"}` (not the
             // standard error shape). Mirror that exactly.
-            if matches!(
-                auth_msg.message_type,
-                bsv::auth::types::MessageType::CertificateResponse
-            ) && auth_msg
-                .certificates
-                .as_ref()
-                .map(|c| c.is_empty())
-                .unwrap_or(true)
+            if matches!(auth_msg.message_type, MessageType::CertificateResponse)
+                && auth_msg
+                    .certificates
+                    .as_ref()
+                    .map(|c| c.is_empty())
+                    .unwrap_or(true)
             {
                 warn!(
                     identity_key = %auth_msg.identity_key,
@@ -368,6 +435,19 @@ where
                     .into_response();
             }
 
+            // Determine the correlation key: TS stores handles under the
+            // incoming `x-bsv-auth-request-id` header when present, else
+            // falls back to `message.initialNonce` (index.ts:413-416).
+            // The HTTP body is the only source we have here, so use
+            // initial_nonce, falling back to nonce.
+            let cert_key = auth_msg
+                .initial_nonce
+                .clone()
+                .or_else(|| auth_msg.nonce.clone())
+                .unwrap_or_default();
+
+            let rx = transport.register_pending(cert_key).await;
+
             if let Err(e) = transport.feed_incoming(auth_msg).await {
                 error!("Failed to feed certificate message: {}", e);
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -375,7 +455,27 @@ where
             if let Err(e) = peer.lock().await.process_pending().await {
                 error!("Peer processing failed for certificate: {}", e);
             }
-            return axum::Json(serde_json::json!({"status": "ok"})).into_response();
+
+            // Short timeout: if the Peer emits a signed outgoing response
+            // for this correlation key, deliver it with the full signed
+            // header set. Otherwise fall back to the minimal ack (the
+            // incoming-cert-only path).
+            match tokio::time::timeout(Duration::from_millis(500), rx).await {
+                Ok(Ok(msg)) => {
+                    debug!(
+                        "Certificate-branch signed response ready: identity_key={}",
+                        msg.identity_key
+                    );
+                    return build_non_general_signed_response(&msg);
+                }
+                Ok(Err(_)) | Err(_) => {
+                    debug!(
+                        "No signed peer response for certificate message; \
+                         returning minimal ack (peer processed via cert channel)"
+                    );
+                    return axum::Json(serde_json::json!({"status": "ok"})).into_response();
+                }
+            }
         }
         _ => {}
     }
@@ -415,28 +515,12 @@ where
         response_msg.identity_key
     );
 
-    // Build response with auth headers
-    let resp_json = serde_json::to_vec(&response_msg).unwrap_or_default();
-
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json")
-        .header("x-bsv-auth-version", &response_msg.version)
-        .header("x-bsv-auth-identity-key", &response_msg.identity_key);
-
-    if let Some(ref n) = response_msg.nonce {
-        builder = builder.header("x-bsv-auth-nonce", n);
-    }
-    if let Some(ref yn) = response_msg.your_nonce {
-        builder = builder.header("x-bsv-auth-your-nonce", yn);
-    }
-    if let Some(ref sig) = response_msg.signature {
-        builder = builder.header("x-bsv-auth-signature", hex::encode(sig));
-    }
-
-    builder
-        .body(Body::from(resp_json))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    // Build the full signed non-general response (includes
+    // `x-bsv-auth-message-type` and, when present,
+    // `x-bsv-auth-requested-certificates`). Matches TS
+    // ExpressTransport.send non-general branch at
+    // auth-express-middleware/src/index.ts:258-286.
+    build_non_general_signed_response(&response_msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +598,26 @@ where
     }
     if let Some(ref sig) = signed_msg.signature {
         builder = builder.header("x-bsv-auth-signature", hex::encode(sig));
+    }
+
+    // TS general branch emits `x-bsv-auth-requested-certificates` when the
+    // outgoing AuthMessage carries requestedCertificates
+    // (auth-express-middleware/src/index.ts:323-325). Crucially, the
+    // general branch does NOT emit `x-bsv-auth-message-type` (it's
+    // implied by the absence of that header per
+    // SimplifiedFetchTransport.ts:217).
+    if let Some(ref req_certs) = signed_msg.requested_certificates {
+        match serde_json::to_string(req_certs) {
+            Ok(json) => {
+                builder = builder.header("x-bsv-auth-requested-certificates", json);
+            }
+            Err(e) => {
+                warn!(
+                    "failed to serialise requested_certificates for general response header: {}",
+                    e
+                );
+            }
+        }
     }
 
     builder
@@ -806,5 +910,131 @@ mod tests {
         assert_eq!(json["code"], "UNAUTHORIZED");
         assert_eq!(json["message"], "Mutual-authentication failed!");
         assert!(json.get("description").is_none());
+    }
+
+    /// Parity with TS `ExpressTransport.send()` non-general branch
+    /// (auth-express-middleware/src/index.ts:258-286): every non-general
+    /// outgoing response MUST carry `x-bsv-auth-message-type` with the
+    /// literal type string, plus version/identity-key/nonce/your-nonce/
+    /// signature.
+    #[tokio::test]
+    async fn test_build_non_general_signed_response_sets_message_type_and_signed_headers() {
+        use axum::body::to_bytes;
+        use bsv::auth::types::MessageType;
+
+        let msg = AuthMessage {
+            version: "0.1".to_string(),
+            message_type: MessageType::InitialResponse,
+            identity_key: "0266...dead".to_string(),
+            nonce: Some("srvNonce==".to_string()),
+            your_nonce: Some("cliNonce==".to_string()),
+            initial_nonce: None,
+            certificates: None,
+            requested_certificates: None,
+            payload: None,
+            signature: Some(vec![0xaa, 0xbb, 0xcc]),
+        };
+
+        let resp = build_non_general_signed_response(&msg);
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let headers = resp.headers().clone();
+        assert_eq!(
+            headers.get("x-bsv-auth-message-type").unwrap(),
+            "initialResponse"
+        );
+        assert_eq!(headers.get("x-bsv-auth-version").unwrap(), "0.1");
+        assert_eq!(
+            headers.get("x-bsv-auth-identity-key").unwrap(),
+            "0266...dead"
+        );
+        assert_eq!(headers.get("x-bsv-auth-nonce").unwrap(), "srvNonce==");
+        assert_eq!(headers.get("x-bsv-auth-your-nonce").unwrap(), "cliNonce==");
+        assert_eq!(headers.get("x-bsv-auth-signature").unwrap(), "aabbcc");
+        assert_eq!(
+            headers.get("content-type").unwrap(),
+            "application/json"
+        );
+        // No requested_certificates on this message -> header absent.
+        assert!(headers.get("x-bsv-auth-requested-certificates").is_none());
+
+        // Body is the JSON-serialised AuthMessage (parity with
+        // TS `res.send(message)` at index.ts:284).
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["version"], "0.1");
+        assert_eq!(parsed["messageType"], "initialResponse");
+    }
+
+    /// Parity with TS `ExpressTransport.send()` at
+    /// auth-express-middleware/src/index.ts:269-271: when the outgoing
+    /// non-general AuthMessage carries `requestedCertificates`, emit
+    /// `x-bsv-auth-requested-certificates` as JSON. Also covers the
+    /// `certificateRequest` message-type literal.
+    #[tokio::test]
+    async fn test_build_non_general_signed_response_emits_requested_certificates_header() {
+        use bsv::auth::types::MessageType;
+
+        let mut req_certs = RequestedCertificateSet::default();
+        req_certs.certifiers.push("certifier-abc".to_string());
+        req_certs
+            .types
+            .insert("typeA".to_string(), vec!["firstName".to_string()]);
+
+        let msg = AuthMessage {
+            version: "0.1".to_string(),
+            message_type: MessageType::CertificateRequest,
+            identity_key: "0266...beef".to_string(),
+            nonce: Some("n==".to_string()),
+            your_nonce: Some("yn==".to_string()),
+            initial_nonce: None,
+            certificates: None,
+            requested_certificates: Some(req_certs),
+            payload: None,
+            signature: Some(vec![0x01, 0x02]),
+        };
+
+        let resp = build_non_general_signed_response(&msg);
+        let headers = resp.headers().clone();
+
+        assert_eq!(
+            headers.get("x-bsv-auth-message-type").unwrap(),
+            "certificateRequest"
+        );
+
+        let req_certs_header = headers
+            .get("x-bsv-auth-requested-certificates")
+            .expect("x-bsv-auth-requested-certificates must be present")
+            .to_str()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(req_certs_header).unwrap();
+        assert_eq!(parsed["certifiers"][0], "certifier-abc");
+        assert_eq!(parsed["types"]["typeA"][0], "firstName");
+    }
+
+    /// Spot-check: the literal header values must match the TS serde
+    /// rename values consumed by SimplifiedFetchTransport.ts:217 — a
+    /// mismatch here would silently break server-initiated
+    /// certificateRequest flows (they'd route as 'general').
+    #[test]
+    fn test_message_type_header_value_matches_ts_literals() {
+        use bsv::auth::types::MessageType;
+        assert_eq!(
+            message_type_header_value(&MessageType::InitialRequest),
+            "initialRequest"
+        );
+        assert_eq!(
+            message_type_header_value(&MessageType::InitialResponse),
+            "initialResponse"
+        );
+        assert_eq!(
+            message_type_header_value(&MessageType::CertificateRequest),
+            "certificateRequest"
+        );
+        assert_eq!(
+            message_type_header_value(&MessageType::CertificateResponse),
+            "certificateResponse"
+        );
+        assert_eq!(message_type_header_value(&MessageType::General), "general");
     }
 }
