@@ -94,7 +94,11 @@ impl axum::response::IntoResponse for AuthMiddlewareError {
 
         let status = match &self {
             AuthMiddlewareError::BsvSdk(e) => match e {
+                // A not-yet-established session is an authentication state, not
+                // a server fault — return 401 (matches TS semantics) rather than
+                // letting it fall through to 500.
                 bsv::auth::AuthError::NotAuthenticated(_)
+                | bsv::auth::AuthError::SessionNotFound(_)
                 | bsv::auth::AuthError::AuthFailed(_)
                 | bsv::auth::AuthError::InvalidSignature(_) => StatusCode::UNAUTHORIZED,
                 bsv::auth::AuthError::Timeout(_) => StatusCode::REQUEST_TIMEOUT,
@@ -105,7 +109,8 @@ impl axum::response::IntoResponse for AuthMiddlewareError {
 
         let code = match &self {
             AuthMiddlewareError::BsvSdk(e) => match e {
-                bsv::auth::AuthError::NotAuthenticated(_) => "ERR_NOT_AUTHENTICATED",
+                bsv::auth::AuthError::NotAuthenticated(_)
+                | bsv::auth::AuthError::SessionNotFound(_) => "ERR_NOT_AUTHENTICATED",
                 bsv::auth::AuthError::AuthFailed(_) => "ERR_AUTH_FAILED",
                 bsv::auth::AuthError::InvalidSignature(_) => "ERR_INVALID_SIGNATURE",
                 bsv::auth::AuthError::Timeout(_) => "ERR_TIMEOUT",

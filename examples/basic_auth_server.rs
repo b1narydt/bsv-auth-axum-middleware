@@ -322,10 +322,10 @@ async fn main() -> std::io::Result<()> {
 
     // Create the transport and peer for BRC-31 protocol handling.
     let transport = Arc::new(ActixTransport::new());
-    let peer = Arc::new(tokio::sync::Mutex::new(Peer::new(
+    let peer = Arc::new(Peer::new(
         wallet.clone(),
         transport.clone(),
-    )));
+    ));
 
     // Build the middleware configuration.
     // Set allow_unauthenticated(false) to require auth on all routes.

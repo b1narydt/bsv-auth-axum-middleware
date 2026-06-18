@@ -82,10 +82,10 @@ pub async fn create_test_server() -> String {
     // Build config + layer in the calling async context so we don't have to
     // send `ActixTransport` across threads without proper setup.
     let transport = Arc::new(ActixTransport::new());
-    let peer = Arc::new(tokio::sync::Mutex::new(Peer::new(
+    let peer = Arc::new(Peer::new(
         server_wallet.clone(),
         transport.clone(),
-    )));
+    ));
 
     let config = AuthMiddlewareConfigBuilder::new()
         .wallet(server_wallet)
@@ -296,10 +296,10 @@ pub async fn create_cert_test_server() -> CertTestContext {
         });
 
     let transport = Arc::new(ActixTransport::new());
-    let peer = Arc::new(tokio::sync::Mutex::new(Peer::new(
+    let peer = Arc::new(Peer::new(
         server_wallet.clone(),
         transport.clone(),
-    )));
+    ));
 
     let config = AuthMiddlewareConfigBuilder::new()
         .wallet(server_wallet)

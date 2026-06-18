@@ -103,7 +103,7 @@ use crate::transport::ActixTransport;
 /// Users register this via `.layer()` on their axum Router.
 #[derive(Clone)]
 pub struct AuthLayer<W: WalletInterface> {
-    peer: Arc<tokio::sync::Mutex<Peer<W>>>,
+    peer: Arc<Peer<W>>,
     transport: Arc<ActixTransport>,
     allow_unauthenticated: bool,
     pub(crate) certificate_gate: Option<CertificateGate>,
@@ -117,7 +117,7 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
     /// * `transport` - Channel-based transport for message correlation.
     /// * `allow_unauthenticated` - Whether to allow requests without auth headers.
     pub fn new(
-        peer: Arc<tokio::sync::Mutex<Peer<W>>>,
+        peer: Arc<Peer<W>>,
         transport: Arc<ActixTransport>,
         allow_unauthenticated: bool,
     ) -> Self {
@@ -144,27 +144,23 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
     ///    certificate events and releases the per-identity gate.
     pub async fn from_config(
         config: crate::config::AuthMiddlewareConfig<W>,
-        peer: Arc<tokio::sync::Mutex<Peer<W>>>,
+        peer: Arc<Peer<W>>,
         transport: Arc<ActixTransport>,
     ) -> Self {
         let certificate_gate = if let Some(certs_to_request) =
             config.certificates_to_request.clone()
         {
-            let (cert_rx, cert_req_rx) = {
-                let mut peer_guard = peer.lock().await;
-                peer_guard.set_certificates_to_request(certs_to_request);
-                let cert_rx = peer_guard.on_certificates();
-                let cert_req_rx = peer_guard.on_certificate_request();
+            // Peer is now fully interior-mutable (`&self`); no outer Mutex.
+            peer.set_certificates_to_request(certs_to_request);
+            let cert_rx = peer.on_certificates();
+            let cert_req_rx = peer.on_certificate_request();
 
-                if cert_rx.is_none() {
-                    warn!("Peer::on_certificates() returned None -- receiver already taken");
-                }
-                if cert_req_rx.is_none() {
-                    warn!("Peer::on_certificate_request() returned None -- receiver already taken");
-                }
-
-                (cert_rx, cert_req_rx)
-            };
+            if cert_rx.is_none() {
+                warn!("Peer::on_certificates() returned None -- receiver already taken");
+            }
+            if cert_req_rx.is_none() {
+                warn!("Peer::on_certificate_request() returned None -- receiver already taken");
+            }
 
             match (cert_rx, cert_req_rx) {
                 (Some(cert_rx), Some(cert_req_rx)) => {
@@ -223,7 +219,7 @@ where
 #[derive(Clone)]
 pub struct AuthService<S, W: WalletInterface> {
     inner: S,
-    peer: Arc<tokio::sync::Mutex<Peer<W>>>,
+    peer: Arc<Peer<W>>,
     transport: Arc<ActixTransport>,
     allow_unauthenticated: bool,
     certificate_gate: Option<CertificateGate>,
@@ -296,13 +292,17 @@ where
                         &headers,
                     );
 
-                    // 3. Verify request signature via Peer
-                    {
-                        let mut peer_guard = peer.lock().await;
-                        if let Err(e) = peer_guard.dispatch_message(auth_msg).await {
-                            warn!("Signature verification failed: {}", e);
-                            return Ok(AuthMiddlewareError::BsvSdk(e).into_response());
-                        }
+                    // 3. Verify request signature via Peer.
+                    //
+                    // HOT PATH: lock-free, fully concurrent. `verify_general_message`
+                    // takes only a SessionManager read lock and does NOT call
+                    // `process_pending` or touch the transport `pending` map, so
+                    // concurrent general requests on one session verify in parallel
+                    // and never drain each other's handshake replies. The handshake
+                    // path (Branch 1) is the only caller of `process_pending`.
+                    if let Err(e) = peer.verify_general_message(auth_msg).await {
+                        warn!("Signature verification failed: {}", e);
+                        return Ok(AuthMiddlewareError::BsvSdk(e).into_response());
                     }
 
                     // 4. Insert identity into extensions
@@ -311,23 +311,36 @@ where
                         identity_key: headers.identity_key.clone(),
                     });
 
-                    // 4b. Certificate gating
+                    // 4b. Certificate gating (register-then-recheck, TOCTOU-safe).
+                    //
+                    // Register the waiter on the gate FIRST, then re-check whether a
+                    // session already exists. This closes the race where a certificate
+                    // arrives (and the listener calls `gate.release`) in the window
+                    // between the session check and the `register`/`notified` await —
+                    // in that case `register` would arm a Notify nobody ever releases
+                    // and the request would hang to the 30s timeout. By registering
+                    // before checking, any release that lands after our check still
+                    // finds our waiter; and if a session already exists we drop the
+                    // waiter and proceed immediately.
                     if let Some(ref gate) = certificate_gate {
-                        let has_session = {
-                            let peer_guard = peer.lock().await;
-                            peer_guard
-                                .session_manager()
-                                .has_session_by_identifier(&headers.identity_key)
-                        };
-                        if !has_session {
-                            let notify = gate.register(&headers.identity_key);
-                            if tokio::time::timeout(Duration::from_secs(30), notify.notified())
-                                .await
-                                .is_err()
-                            {
-                                warn!(identity_key = %headers.identity_key, "certificate request timed out");
-                                return Ok(AuthMiddlewareError::CertificateTimeout.into_response());
-                            }
+                        let notify = gate.register(&headers.identity_key);
+                        if peer
+                            .session_by_identifier(&headers.identity_key)
+                            .await
+                            .is_some()
+                        {
+                            // Session already established — release our gate entry and
+                            // proceed without waiting.
+                            gate.release(&headers.identity_key);
+                        } else if tokio::time::timeout(
+                            Duration::from_secs(30),
+                            notify.notified(),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            warn!(identity_key = %headers.identity_key, "certificate request timed out");
+                            return Ok(AuthMiddlewareError::CertificateTimeout.into_response());
                         }
                     }
 
@@ -364,7 +377,7 @@ where
 
 async fn handle_handshake<W>(
     req: Request<Body>,
-    peer: Arc<tokio::sync::Mutex<Peer<W>>>,
+    peer: Arc<Peer<W>>,
     transport: Arc<ActixTransport>,
 ) -> Response<Body>
 where
@@ -452,7 +465,10 @@ where
                 error!("Failed to feed certificate message: {}", e);
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
-            if let Err(e) = peer.lock().await.process_pending().await {
+            // HANDSHAKE/CERT path: the Peer serializes `process_pending`
+            // internally on its own handshake mutex, so no outer Mutex is
+            // needed and general-message verifies are not blocked.
+            if let Err(e) = peer.process_pending().await {
                 error!("Peer processing failed for certificate: {}", e);
             }
 
@@ -489,12 +505,12 @@ where
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    {
-        let mut peer_guard = peer.lock().await;
-        if let Err(e) = peer_guard.process_pending().await {
-            error!("Peer processing failed during handshake: {}", e);
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+    // HANDSHAKE path: `process_pending` serializes internally on the Peer's
+    // own handshake mutex; no outer Mutex needed and general verifies run
+    // concurrently.
+    if let Err(e) = peer.process_pending().await {
+        error!("Peer processing failed during handshake: {}", e);
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     // Wait for signed response
@@ -529,7 +545,7 @@ where
 
 async fn handle_response_signing<W>(
     service_resp: Response<Body>,
-    peer: Arc<tokio::sync::Mutex<Peer<W>>>,
+    peer: Arc<Peer<W>>,
     request_headers: &crate::helpers::AuthHeaders,
     _request_body: &[u8],
 ) -> Response<Body>
@@ -558,18 +574,19 @@ where
         &body_bytes,
     );
 
-    // 3. Sign via Peer
-    let signed_msg = {
-        let peer_guard = peer.lock().await;
-        match peer_guard
-            .create_general_message(&request_headers.your_nonce, response_payload)
-            .await
-        {
-            Ok(msg) => msg,
-            Err(e) => {
-                error!("Response signing failed: {}", e);
-                return AuthMiddlewareError::ResponseSigningFailed(e.to_string()).into_response();
-            }
+    // 3. Sign via Peer.
+    //
+    // HOT PATH: lock-free, fully concurrent. `create_general_message` is
+    // `&self` (SessionManager read only) and does not touch the handshake
+    // path, so concurrent responses on one session sign in parallel.
+    let signed_msg = match peer
+        .create_general_message(&request_headers.your_nonce, response_payload)
+        .await
+    {
+        Ok(msg) => msg,
+        Err(e) => {
+            error!("Response signing failed: {}", e);
+            return AuthMiddlewareError::ResponseSigningFailed(e.to_string()).into_response();
         }
     };
 
@@ -836,10 +853,10 @@ mod tests {
     #[tokio::test]
     async fn test_from_config_without_certs_has_no_gate() {
         let transport = Arc::new(ActixTransport::new());
-        let peer = Arc::new(tokio::sync::Mutex::new(Peer::new(
+        let peer = Arc::new(Peer::new(
             MockWallet,
             transport.clone(),
-        )));
+        ));
 
         let config = AuthMiddlewareConfigBuilder::new()
             .wallet(MockWallet)
@@ -854,10 +871,10 @@ mod tests {
     #[tokio::test]
     async fn test_from_config_with_certs_spawns_gate() {
         let transport = Arc::new(ActixTransport::new());
-        let peer = Arc::new(tokio::sync::Mutex::new(Peer::new(
+        let peer = Arc::new(Peer::new(
             MockWallet,
             transport.clone(),
-        )));
+        ));
 
         let mut certs = RequestedCertificateSet::default();
         certs
@@ -884,10 +901,10 @@ mod tests {
         use tower::ServiceExt;
 
         let transport = Arc::new(ActixTransport::new());
-        let peer = Arc::new(tokio::sync::Mutex::new(Peer::new(
+        let peer = Arc::new(Peer::new(
             MockWallet,
             transport.clone(),
-        )));
+        ));
 
         let config = AuthMiddlewareConfigBuilder::new()
             .wallet(MockWallet)

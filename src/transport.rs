@@ -454,13 +454,16 @@ mod tests {
     async fn test_peer_shared_state() {
         let transport = Arc::new(ActixTransport::new());
         let peer = Peer::new(MockWallet, transport.clone());
-        let shared_peer = Arc::new(tokio::sync::Mutex::new(peer));
+        // Peer is now fully interior-mutable: shareable directly via Arc<Peer>
+        // with NO outer Mutex. Every method takes &self.
+        let shared_peer = Arc::new(peer);
 
         // Clone into a spawned task to prove Send + Sync
         let peer_clone = shared_peer.clone();
         let handle = tokio::spawn(async move {
-            let _lock = peer_clone.lock().await;
-            // If this compiles and runs, Peer is shareable via Arc<Mutex<Peer>>
+            // If this compiles and runs, Peer is shareable via Arc<Peer>
+            // and callable concurrently with only &self.
+            let _ = peer_clone.session_by_identifier("none").await;
             true
         });
 
