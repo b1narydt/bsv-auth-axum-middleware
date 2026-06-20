@@ -74,7 +74,7 @@ pub async fn create_test_server() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     listener.set_nonblocking(true).expect("set_nonblocking");
     let addr: SocketAddr = listener.local_addr().expect("local_addr");
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
     let server_key = PrivateKey::from_random().expect("failed to generate server key");
     let server_wallet = MockWallet::new(server_key);
@@ -82,10 +82,7 @@ pub async fn create_test_server() -> String {
     // Build config + layer in the calling async context so we don't have to
     // send `ActixTransport` across threads without proper setup.
     let transport = Arc::new(ActixTransport::new());
-    let peer = Arc::new(Peer::new(
-        server_wallet.clone(),
-        transport.clone(),
-    ));
+    let peer = Arc::new(Peer::new(server_wallet.clone(), transport.clone()));
 
     let config = AuthMiddlewareConfigBuilder::new()
         .wallet(server_wallet)
@@ -107,7 +104,7 @@ pub async fn create_test_server() -> String {
         .route("/custom-headers", get(handler_custom_headers))
         .layer(layer);
 
-    println!("Test server started at {}", base_url);
+    println!("Test server started at {base_url}");
 
     // Spawn a background thread with its own Tokio runtime. The thread is
     // leaked (never joined) so the server lives for the process lifetime,
@@ -183,7 +180,7 @@ async fn handler_large_upload(_auth: Authenticated, body: Bytes) -> impl IntoRes
 
 async fn handler_query(_auth: Authenticated, req: Request) -> impl IntoResponse {
     let query = req.uri().query().unwrap_or("");
-    println!("[handler] GET /query-endpoint -- query: {}", query);
+    println!("[handler] GET /query-endpoint -- query: {query}");
     axum::Json(serde_json::json!({
         "status": "query received",
         "query": query
@@ -193,7 +190,7 @@ async fn handler_query(_auth: Authenticated, req: Request) -> impl IntoResponse 
 async fn handler_custom_headers(_auth: Authenticated, headers: HeaderMap) -> impl IntoResponse {
     println!("[handler] GET /custom-headers");
     for (name, value) in headers.iter() {
-        println!("  header: {} = {:?}", name, value);
+        println!("  header: {name} = {value:?}");
     }
     axum::Json(serde_json::json!({"status": "headers received"}))
 }
@@ -296,10 +293,7 @@ pub async fn create_cert_test_server() -> CertTestContext {
         });
 
     let transport = Arc::new(ActixTransport::new());
-    let peer = Arc::new(Peer::new(
-        server_wallet.clone(),
-        transport.clone(),
-    ));
+    let peer = Arc::new(Peer::new(server_wallet.clone(), transport.clone()));
 
     let config = AuthMiddlewareConfigBuilder::new()
         .wallet(server_wallet)
@@ -322,12 +316,9 @@ pub async fn create_cert_test_server() -> CertTestContext {
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind cert test listener");
     std_listener.set_nonblocking(true).expect("set_nonblocking");
     let addr: SocketAddr = std_listener.local_addr().expect("local_addr");
-    let base_url = format!("http://{}", addr);
+    let base_url = format!("http://{addr}");
 
-    println!(
-        "[cert_server] Certificate test server started at {}",
-        base_url
-    );
+    println!("[cert_server] Certificate test server started at {base_url}");
 
     // Spawn a dedicated background thread with its own Tokio runtime,
     // matching the pattern from create_test_server. The thread is leaked

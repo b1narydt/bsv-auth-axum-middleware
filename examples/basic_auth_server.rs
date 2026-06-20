@@ -322,10 +322,7 @@ async fn main() -> std::io::Result<()> {
 
     // Create the transport and peer for BRC-31 protocol handling.
     let transport = Arc::new(ActixTransport::new());
-    let peer = Arc::new(Peer::new(
-        wallet.clone(),
-        transport.clone(),
-    ));
+    let peer = Arc::new(Peer::new(wallet.clone(), transport.clone()));
 
     // Build the middleware configuration.
     // Set allow_unauthenticated(false) to require auth on all routes.
@@ -349,11 +346,11 @@ async fn main() -> std::io::Result<()> {
     // Bind the listener and start serving.
     let listener = TcpListener::bind("127.0.0.1:8080")
         .await
-        .map_err(|e| std::io::Error::other(format!("failed to bind: {}", e)))?;
+        .map_err(|e| std::io::Error::other(format!("failed to bind: {e}")))?;
 
     axum::serve(listener, app)
         .await
-        .map_err(|e| std::io::Error::other(format!("server error: {}", e)))?;
+        .map_err(|e| std::io::Error::other(format!("server error: {e}")))?;
 
     Ok(())
 }

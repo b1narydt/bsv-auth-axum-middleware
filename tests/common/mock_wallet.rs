@@ -191,10 +191,7 @@ impl WalletInterface for MockWallet {
                     )
                     .await
                     .map_err(|e| {
-                        WalletError::Internal(format!(
-                            "failed to create keyring for verifier: {}",
-                            e
-                        ))
+                        WalletError::Internal(format!("failed to create keyring for verifier: {e}"))
                     })?;
                 Ok(ProveCertificateResult {
                     keyring_for_verifier: keyring,

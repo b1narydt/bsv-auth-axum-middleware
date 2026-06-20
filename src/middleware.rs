@@ -151,6 +151,26 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
             config.certificates_to_request.clone()
         {
             // Peer is now fully interior-mutable (`&self`); no outer Mutex.
+            //
+            // BRC-31 cert-exchange normalization: the bsv-sdk Peer only drives a
+            // certificate exchange when the advertised `RequestedCertificateSet`
+            // has a **non-empty `certifiers`** list — both the responder
+            // (`handle_initial_request`/`complete_handshake`) and the requester
+            // short-circuit on `requested.certifiers.is_empty()` (bsv-sdk
+            // `auth/peer.rs`). A server that configures `certificates_to_request`
+            // with cert *types* but no explicit certifiers means "request these
+            // types from any certifier" (the BRC-31 `"*"` wildcard); leaving
+            // `certifiers` empty would make the SDK silently advertise the
+            // request and never complete the handshake's cert round-trip, so the
+            // gated endpoint would 401 even though the client holds a matching
+            // certificate. We therefore normalize an empty `certifiers` to the
+            // `"*"` wildcard so the SDK actually performs the exchange. This is
+            // wire-compatible: peers match offered certificates by type and treat
+            // `"*"` as "any certifier" (the client never rejects on certifier).
+            let mut certs_to_request = certs_to_request;
+            if certs_to_request.certifiers.is_empty() {
+                certs_to_request.certifiers.push("*".to_string());
+            }
             peer.set_certificates_to_request(certs_to_request);
             let cert_rx = peer.on_certificates();
             let cert_req_rx = peer.on_certificate_request();
@@ -332,12 +352,9 @@ where
                             // Session already established — release our gate entry and
                             // proceed without waiting.
                             gate.release(&headers.identity_key);
-                        } else if tokio::time::timeout(
-                            Duration::from_secs(30),
-                            notify.notified(),
-                        )
-                        .await
-                        .is_err()
+                        } else if tokio::time::timeout(Duration::from_secs(30), notify.notified())
+                            .await
+                            .is_err()
                         {
                             warn!(identity_key = %headers.identity_key, "certificate request timed out");
                             return Ok(AuthMiddlewareError::CertificateTimeout.into_response());
@@ -853,10 +870,7 @@ mod tests {
     #[tokio::test]
     async fn test_from_config_without_certs_has_no_gate() {
         let transport = Arc::new(ActixTransport::new());
-        let peer = Arc::new(Peer::new(
-            MockWallet,
-            transport.clone(),
-        ));
+        let peer = Arc::new(Peer::new(MockWallet, transport.clone()));
 
         let config = AuthMiddlewareConfigBuilder::new()
             .wallet(MockWallet)
@@ -871,10 +885,7 @@ mod tests {
     #[tokio::test]
     async fn test_from_config_with_certs_spawns_gate() {
         let transport = Arc::new(ActixTransport::new());
-        let peer = Arc::new(Peer::new(
-            MockWallet,
-            transport.clone(),
-        ));
+        let peer = Arc::new(Peer::new(MockWallet, transport.clone()));
 
         let mut certs = RequestedCertificateSet::default();
         certs
@@ -901,10 +912,7 @@ mod tests {
         use tower::ServiceExt;
 
         let transport = Arc::new(ActixTransport::new());
-        let peer = Arc::new(Peer::new(
-            MockWallet,
-            transport.clone(),
-        ));
+        let peer = Arc::new(Peer::new(MockWallet, transport.clone()));
 
         let config = AuthMiddlewareConfigBuilder::new()
             .wallet(MockWallet)
@@ -968,10 +976,7 @@ mod tests {
         assert_eq!(headers.get("x-bsv-auth-nonce").unwrap(), "srvNonce==");
         assert_eq!(headers.get("x-bsv-auth-your-nonce").unwrap(), "cliNonce==");
         assert_eq!(headers.get("x-bsv-auth-signature").unwrap(), "aabbcc");
-        assert_eq!(
-            headers.get("content-type").unwrap(),
-            "application/json"
-        );
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
         // No requested_certificates on this message -> header absent.
         assert!(headers.get("x-bsv-auth-requested-certificates").is_none());
 

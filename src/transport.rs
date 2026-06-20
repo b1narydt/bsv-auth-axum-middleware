@@ -144,7 +144,7 @@ impl ActixTransport {
     /// Feed an incoming auth message to the Peer's subscription channel.
     pub async fn feed_incoming(&self, message: AuthMessage) -> Result<(), AuthMiddlewareError> {
         self.incoming_tx.send(message).await.map_err(|e| {
-            AuthMiddlewareError::Transport(format!("failed to send incoming message: {}", e))
+            AuthMiddlewareError::Transport(format!("failed to send incoming message: {e}"))
         })
     }
 }
@@ -167,7 +167,7 @@ impl Transport for ActixTransport {
             .to_string();
 
         let entry = self.pending.lock().await.remove(&key).ok_or_else(|| {
-            AuthError::TransportError(format!("no pending request for nonce: {}", key))
+            AuthError::TransportError(format!("no pending request for nonce: {key}"))
         })?;
 
         // Cancel the timeout task so it doesn't later try to remove an
@@ -485,8 +485,7 @@ mod tests {
         // Sender was dropped by the timeout task -> RecvError.
         assert!(
             rx_result.is_err(),
-            "expected RecvError after timeout fired, got {:?}",
-            rx_result
+            "expected RecvError after timeout fired, got {rx_result:?}"
         );
 
         // Pending map must be cleaned up.

@@ -47,30 +47,22 @@ fn test_certificate_reserializes_to_ts_camelcase() {
     let out = serde_json::to_value(&cert).expect("serialize back to JSON");
 
     // Must contain camelCase keys (TS contract).
-    assert!(
-        out.get("type").is_some(),
-        "missing 'type' key; got: {}",
-        out
-    );
+    assert!(out.get("type").is_some(), "missing 'type' key; got: {out}");
     assert!(
         out.get("serialNumber").is_some(),
-        "missing 'serialNumber' key; got: {}",
-        out
+        "missing 'serialNumber' key; got: {out}"
     );
     assert!(
         out.get("subject").is_some(),
-        "missing 'subject' key; got: {}",
-        out
+        "missing 'subject' key; got: {out}"
     );
     assert!(
         out.get("certifier").is_some(),
-        "missing 'certifier' key; got: {}",
-        out
+        "missing 'certifier' key; got: {out}"
     );
     assert!(
         out.get("revocationOutpoint").is_some(),
-        "missing 'revocationOutpoint' key; got: {}",
-        out
+        "missing 'revocationOutpoint' key; got: {out}"
     );
 
     // Must NOT contain snake_case leaks.

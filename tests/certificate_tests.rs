@@ -122,15 +122,15 @@ async fn test_cert_protected_endpoint() {
     client_wallet.add_master_certificate(master_cert).await;
 
     // Create AuthFetch with client wallet
-    let mut auth_fetch = AuthFetch::new(client_wallet);
+    let auth_fetch = AuthFetch::new(client_wallet);
 
     // POST to cert-protected endpoint
-    let url = format!("{}/cert-protected-endpoint", base_url);
+    let url = format!("{base_url}/cert-protected-endpoint");
     let body = serde_json::to_vec(&serde_json::json!({"message": "Hello protected Route!"}))
         .expect("serialize body");
     let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
 
-    println!("[test_cert_protected] POST {}", url);
+    println!("[test_cert_protected] POST {url}");
 
     let response = auth_fetch
         .fetch(&url, "POST", Some(body), Some(headers))
@@ -196,7 +196,7 @@ async fn test_empty_cert_response_returns_400() {
         "certificates": []
     });
 
-    let url = format!("{}/.well-known/auth", base_url);
+    let url = format!("{base_url}/.well-known/auth");
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
@@ -239,7 +239,7 @@ async fn test_cert_response_with_missing_certs_field_returns_400() {
         // certificates field deliberately omitted
     });
 
-    let url = format!("{}/.well-known/auth", base_url);
+    let url = format!("{base_url}/.well-known/auth");
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
@@ -291,11 +291,8 @@ async fn test_cert_request_flow() {
     auth_fetch.set_requested_certificates(requested);
 
     // Make a request to trigger handshake + cert exchange
-    let url = format!("{}/", base_url);
-    println!(
-        "[test_cert_request] GET {} with requested certificates",
-        url
-    );
+    let url = format!("{base_url}/");
+    println!("[test_cert_request] GET {url} with requested certificates");
 
     let response = auth_fetch
         .fetch(&url, "GET", None, None)

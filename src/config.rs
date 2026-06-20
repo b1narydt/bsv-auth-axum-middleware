@@ -457,7 +457,7 @@ mod tests {
             AuthMiddlewareError::Config(msg) => {
                 assert_eq!(msg, "wallet is required");
             }
-            _ => panic!("expected Config error, got: {:?}", err),
+            _ => panic!("expected Config error, got: {err:?}"),
         }
     }
 
