@@ -28,6 +28,7 @@ impl<W: WalletInterface> std::fmt::Debug for AuthMiddlewareConfig<W> {
                 "certificates_to_request",
                 &self.certificates_to_request.is_some(),
             )
+            .field("trusted_certifiers", &self.trusted_certifiers)
             .field("session_manager", &self.session_manager.is_some())
             .field(
                 "on_certificates_received",
@@ -51,7 +52,28 @@ pub struct AuthMiddlewareConfig<W: WalletInterface> {
     /// Defaults to `false`.
     pub allow_unauthenticated: bool,
     /// Optional set of certificates to request from peers during authentication.
+    ///
+    /// Supplies the requested certificate **types** advertised to peers and
+    /// enforced during validation. The certifiers advertised in the handshake
+    /// and pinned during validation are taken from [`Self::trusted_certifiers`],
+    /// not from this field's `certifiers` list.
     pub certificates_to_request: Option<RequestedCertificateSet>,
+    /// Certifier identity keys (compressed DER hex) the server trusts.
+    ///
+    /// This is the single control for certificate gating (strictly better than
+    /// the TS server path, which skips certifier pinning):
+    /// - **Empty** (default) — certificates are NOT required; no gate is engaged.
+    /// - **Non-empty** — certificate validation is MANDATORY. Incoming
+    ///   certificates must be signed by a certifier in this set (and bind to the
+    ///   sender, and match a requested type when configured) before the request
+    ///   is allowed through. These certifiers are also advertised to peers in the
+    ///   handshake so clients offer matching certificates.
+    ///
+    /// Cannot be combined with `allow_unauthenticated(true)` — a cert gate
+    /// requires authentication (rejected at [`AuthLayer::from_config`]).
+    ///
+    /// [`AuthLayer::from_config`]: crate::middleware::AuthLayer::from_config
+    pub trusted_certifiers: Vec<String>,
     /// Optional session manager for tracking authenticated sessions.
     pub session_manager: Option<SessionManager>,
     /// Optional callback invoked when certificates are received from a peer.
@@ -104,6 +126,7 @@ pub struct AuthMiddlewareConfigBuilder<W: WalletInterface> {
     wallet: Option<W>,
     allow_unauthenticated: bool,
     certificates_to_request: Option<RequestedCertificateSet>,
+    trusted_certifiers: Vec<String>,
     session_manager: Option<SessionManager>,
     on_certificates_received: Option<Arc<OnCertificatesReceived>>,
     log_level: Option<tracing::Level>,
@@ -124,6 +147,7 @@ impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
             wallet: None,
             allow_unauthenticated: false,
             certificates_to_request: None,
+            trusted_certifiers: Vec::new(),
             session_manager: None,
             on_certificates_received: None,
             log_level: None,
@@ -145,6 +169,16 @@ impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
     /// Set the certificates to request from peers.
     pub fn certificates_to_request(mut self, certs: RequestedCertificateSet) -> Self {
         self.certificates_to_request = Some(certs);
+        self
+    }
+
+    /// Set the trusted certifier identity keys (compressed DER hex).
+    ///
+    /// A non-empty set engages MANDATORY certificate validation and the
+    /// per-identity gate; an empty set (the default) means certificates are not
+    /// required. See [`AuthMiddlewareConfig::trusted_certifiers`].
+    pub fn trusted_certifiers(mut self, certifiers: Vec<String>) -> Self {
+        self.trusted_certifiers = certifiers;
         self
     }
 
@@ -186,6 +220,7 @@ impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
             wallet,
             allow_unauthenticated: self.allow_unauthenticated,
             certificates_to_request: self.certificates_to_request,
+            trusted_certifiers: self.trusted_certifiers,
             session_manager: self.session_manager,
             on_certificates_received: self.on_certificates_received,
             log_level: self.log_level,

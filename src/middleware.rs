@@ -87,7 +87,7 @@ fn build_non_general_signed_response(msg: &AuthMessage) -> Response<Body> {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-use crate::certificate::CertificateGate;
+use crate::certificate::{CertificateGate, CertificateValidationPolicy};
 use crate::error::AuthMiddlewareError;
 use crate::extractor::Authenticated;
 use crate::helpers::{build_auth_message, extract_auth_headers};
@@ -135,43 +135,69 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
         self
     }
 
+    /// The certificate gate, if certificate gating is engaged.
+    ///
+    /// `Some` only when `trusted_certifiers` was non-empty at construction.
+    pub fn certificate_gate_ref(&self) -> Option<&CertificateGate> {
+        self.certificate_gate.as_ref()
+    }
+
     /// Create an auth layer from configuration.
     ///
-    /// When `config.certificates_to_request` is `Some`, this constructor:
-    /// 1. Configures the Peer with the requested certificate set.
+    /// Certificate gating is engaged when `config.trusted_certifiers` is
+    /// **non-empty** — this is the single control (strictly better than the TS
+    /// server path, which skips certifier pinning). When engaged, this
+    /// constructor:
+    /// 1. Advertises the trusted certifiers (plus any requested types) to peers
+    ///    via the Peer's `RequestedCertificateSet`, so clients offer matching
+    ///    certificates and the SDK actually drives the cert exchange (the SDK
+    ///    short-circuits on an empty `certifiers` list).
     /// 2. Takes the certificate receivers from the Peer (one-shot take).
-    /// 3. Spawns a background `certificate_listener_task` that consumes
-    ///    certificate events and releases the per-identity gate.
+    /// 3. Spawns a background `certificate_listener_task` that VALIDATES each
+    ///    incoming certificate (subject-bind + certifier-PIN + type-PIN +
+    ///    certifier-signature) and releases the per-identity gate only on
+    ///    success.
+    ///
+    /// # Errors
+    /// Returns `AuthMiddlewareError::Config` when `allow_unauthenticated` is
+    /// combined with a non-empty `trusted_certifiers` set — a certificate gate
+    /// requires authentication, so the combination is contradictory (F5).
     pub async fn from_config(
         config: crate::config::AuthMiddlewareConfig<W>,
         peer: Arc<Peer<W>>,
         transport: Arc<ActixTransport>,
-    ) -> Self {
-        let certificate_gate = if let Some(certs_to_request) =
-            config.certificates_to_request.clone()
-        {
-            // Peer is now fully interior-mutable (`&self`); no outer Mutex.
+    ) -> Result<Self, AuthMiddlewareError> {
+        // F5: a certificate gate requires authentication; refuse to combine it
+        // with `allow_unauthenticated`, which would let callers bypass the gate
+        // entirely via the no-auth-headers passthrough branch.
+        if config.allow_unauthenticated && !config.trusted_certifiers.is_empty() {
+            return Err(AuthMiddlewareError::Config(
+                "allow_unauthenticated cannot be combined with certificate gating \
+                 (non-empty trusted_certifiers): a cert gate requires authentication"
+                    .to_string(),
+            ));
+        }
+
+        let certificate_gate = if config.trusted_certifiers.is_empty() {
+            // Empty trusted set => certificates NOT required; no gate.
+            None
+        } else {
+            // Non-empty trusted set => certificate validation MANDATORY.
             //
-            // BRC-31 cert-exchange normalization: the bsv-sdk Peer only drives a
-            // certificate exchange when the advertised `RequestedCertificateSet`
-            // has a **non-empty `certifiers`** list — both the responder
-            // (`handle_initial_request`/`complete_handshake`) and the requester
-            // short-circuit on `requested.certifiers.is_empty()` (bsv-sdk
-            // `auth/peer.rs`). A server that configures `certificates_to_request`
-            // with cert *types* but no explicit certifiers means "request these
-            // types from any certifier" (the BRC-31 `"*"` wildcard); leaving
-            // `certifiers` empty would make the SDK silently advertise the
-            // request and never complete the handshake's cert round-trip, so the
-            // gated endpoint would 401 even though the client holds a matching
-            // certificate. We therefore normalize an empty `certifiers` to the
-            // `"*"` wildcard so the SDK actually performs the exchange. This is
-            // wire-compatible: peers match offered certificates by type and treat
-            // `"*"` as "any certifier" (the client never rejects on certifier).
-            let mut certs_to_request = certs_to_request;
-            if certs_to_request.certifiers.is_empty() {
-                certs_to_request.certifiers.push("*".to_string());
-            }
-            peer.set_certificates_to_request(certs_to_request);
+            // Advertise the trusted certifiers (and any requested types) to peers.
+            // The bsv-sdk Peer only drives the cert exchange when the advertised
+            // `RequestedCertificateSet` has a non-empty `certifiers` list, so we
+            // populate it from our CONFIGURED trusted certifiers (no `"*"`
+            // wildcard) — the client offers matching certs and we pin server-side
+            // against the same set.
+            let mut requested = config.certificates_to_request.clone().unwrap_or_default();
+            requested.certifiers = config.trusted_certifiers.clone();
+            let policy = Arc::new(CertificateValidationPolicy {
+                trusted_certifiers: config.trusted_certifiers.clone(),
+                requested_types: requested.types.clone(),
+            });
+
+            peer.set_certificates_to_request(requested);
             let cert_rx = peer.on_certificates();
             let cert_req_rx = peer.on_certificate_request();
 
@@ -191,9 +217,10 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
                         cert_rx,
                         cert_req_rx,
                         gate_clone,
+                        policy,
                         callback,
                     ));
-                    debug!("certificate listener task spawned");
+                    debug!("certificate listener task spawned (validation enforced)");
                     Some(gate)
                 }
                 _ => {
@@ -201,16 +228,14 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
                     None
                 }
             }
-        } else {
-            None
         };
 
-        Self {
+        Ok(Self {
             peer,
             transport,
             allow_unauthenticated: config.allow_unauthenticated,
             certificate_gate,
-        }
+        })
     }
 }
 
@@ -325,41 +350,59 @@ where
                         return Ok(AuthMiddlewareError::BsvSdk(e).into_response());
                     }
 
-                    // 4. Insert identity into extensions
                     let mut parts = parts;
-                    parts.extensions.insert(Authenticated {
-                        identity_key: headers.identity_key.clone(),
-                    });
 
-                    // 4b. Certificate gating (register-then-recheck, TOCTOU-safe).
+                    // 4. Certificate gating — authorise on VALIDATED-CERTIFICATE
+                    // PRESENCE, never on session existence (F1 fix).
                     //
-                    // Register the waiter on the gate FIRST, then re-check whether a
-                    // session already exists. This closes the race where a certificate
-                    // arrives (and the listener calls `gate.release`) in the window
-                    // between the session check and the `register`/`notified` await —
-                    // in that case `register` would arm a Notify nobody ever releases
-                    // and the request would hang to the 30s timeout. By registering
-                    // before checking, any release that lands after our check still
-                    // finds our waiter; and if a session already exists we drop the
-                    // waiter and proceed immediately.
+                    // When a cert gate is engaged, the request is released only
+                    // once the background listener has recorded validated
+                    // certificates for this identity (subject-bind + certifier-PIN
+                    // + type-PIN + certifier-signature all passed). A caller with a
+                    // live signature-verified session but no valid certificate does
+                    // NOT pass here.
+                    //
+                    // F4 lost-wakeup fix: arm the `Notified` future (via `enable()`)
+                    // BEFORE checking the validated-cert store, so a release that
+                    // lands between the check and the await still wakes us. If the
+                    // certs are already present we skip the wait entirely.
+                    let mut validated_certs: Vec<bsv::wallet::interfaces::Certificate> = Vec::new();
                     if let Some(ref gate) = certificate_gate {
                         let notify = gate.register(&headers.identity_key);
-                        if peer
-                            .session_by_identifier(&headers.identity_key)
-                            .await
-                            .is_some()
-                        {
-                            // Session already established — release our gate entry and
-                            // proceed without waiting.
-                            gate.release(&headers.identity_key);
-                        } else if tokio::time::timeout(Duration::from_secs(30), notify.notified())
-                            .await
-                            .is_err()
-                        {
-                            warn!(identity_key = %headers.identity_key, "certificate request timed out");
-                            return Ok(AuthMiddlewareError::CertificateTimeout.into_response());
+                        let notified = notify.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+
+                        match gate.validated_for(&headers.identity_key) {
+                            Some(certs) => {
+                                validated_certs = certs;
+                            }
+                            None => {
+                                if tokio::time::timeout(Duration::from_secs(30), notified)
+                                    .await
+                                    .is_err()
+                                {
+                                    warn!(identity_key = %headers.identity_key, "certificate validation timed out");
+                                    return Ok(AuthMiddlewareError::CertificateTimeout.into_response());
+                                }
+                                match gate.validated_for(&headers.identity_key) {
+                                    Some(certs) => validated_certs = certs,
+                                    None => {
+                                        // Woken without validated certs => no valid
+                                        // certificate was presented. Reject.
+                                        warn!(identity_key = %headers.identity_key, "no valid certificate presented -- rejecting cert-gated request");
+                                        return Ok(AuthMiddlewareError::CertificateTimeout.into_response());
+                                    }
+                                }
+                            }
                         }
                     }
+
+                    // 4b. Surface identity + validated certs to the handler.
+                    parts.extensions.insert(Authenticated {
+                        identity_key: headers.identity_key.clone(),
+                        certificates: validated_certs,
+                    });
 
                     // 5. Re-inject body and call inner service
                     let request = Request::from_parts(parts, Body::from(body_bytes.clone()));
@@ -375,6 +418,7 @@ where
                         let (mut parts, body) = req.into_parts();
                         parts.extensions.insert(Authenticated {
                             identity_key: "unknown".to_string(),
+                            certificates: Vec::new(),
                         });
                         let req = Request::from_parts(parts, body);
                         inner.call(req).await
@@ -878,19 +922,46 @@ mod tests {
             .build()
             .unwrap();
 
-        let layer = AuthLayer::from_config(config, peer, transport).await;
+        let layer = AuthLayer::from_config(config, peer, transport)
+            .await
+            .expect("from_config");
         assert!(layer.certificate_gate.is_none());
     }
 
     #[tokio::test]
-    async fn test_from_config_with_certs_spawns_gate() {
+    async fn test_from_config_with_trusted_certifiers_spawns_gate() {
         let transport = Arc::new(ActixTransport::new());
         let peer = Arc::new(Peer::new(MockWallet, transport.clone()));
 
         let mut certs = RequestedCertificateSet::default();
         certs
             .types
-            .insert("certifier1".to_string(), vec!["field1".to_string()]);
+            .insert("someType".to_string(), vec!["field1".to_string()]);
+
+        // A non-empty trusted_certifiers set is what engages the gate.
+        let config = AuthMiddlewareConfigBuilder::new()
+            .wallet(MockWallet)
+            .certificates_to_request(certs)
+            .trusted_certifiers(vec!["02aabbccdd".to_string()])
+            .build()
+            .unwrap();
+
+        let layer = AuthLayer::from_config(config, peer, transport)
+            .await
+            .expect("from_config");
+        assert!(layer.certificate_gate.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_from_config_types_without_trusted_certifiers_has_no_gate() {
+        // Requested types but NO trusted certifiers => certs not required, no gate.
+        let transport = Arc::new(ActixTransport::new());
+        let peer = Arc::new(Peer::new(MockWallet, transport.clone()));
+
+        let mut certs = RequestedCertificateSet::default();
+        certs
+            .types
+            .insert("someType".to_string(), vec!["field1".to_string()]);
 
         let config = AuthMiddlewareConfigBuilder::new()
             .wallet(MockWallet)
@@ -898,8 +969,30 @@ mod tests {
             .build()
             .unwrap();
 
-        let layer = AuthLayer::from_config(config, peer, transport).await;
-        assert!(layer.certificate_gate.is_some());
+        let layer = AuthLayer::from_config(config, peer, transport)
+            .await
+            .expect("from_config");
+        assert!(layer.certificate_gate.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_from_config_rejects_allow_unauth_with_cert_gate() {
+        // F5: allow_unauthenticated + trusted_certifiers must be rejected.
+        let transport = Arc::new(ActixTransport::new());
+        let peer = Arc::new(Peer::new(MockWallet, transport.clone()));
+
+        let config = AuthMiddlewareConfigBuilder::new()
+            .wallet(MockWallet)
+            .allow_unauthenticated(true)
+            .trusted_certifiers(vec!["02aabbccdd".to_string()])
+            .build()
+            .unwrap();
+
+        let result = AuthLayer::from_config(config, peer, transport).await;
+        assert!(
+            matches!(result, Err(AuthMiddlewareError::Config(_))),
+            "allow_unauthenticated + cert gate must be a Config error"
+        );
     }
 
     #[tokio::test]
@@ -919,7 +1012,9 @@ mod tests {
             .allow_unauthenticated(false)
             .build()
             .unwrap();
-        let layer = AuthLayer::from_config(config, peer, transport).await;
+        let layer = AuthLayer::from_config(config, peer, transport)
+            .await
+            .expect("from_config");
 
         let app = Router::new()
             .route("/", get(|| async { "hello" }))

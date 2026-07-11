@@ -90,7 +90,9 @@ pub async fn create_test_server() -> String {
         .build()
         .expect("failed to build middleware config");
 
-    let layer = AuthLayer::from_config(config, peer.clone(), transport.clone()).await;
+    let layer = AuthLayer::from_config(config, peer.clone(), transport.clone())
+        .await
+        .expect("failed to build auth layer");
 
     let app = Router::new()
         .route("/", get(handler_root))
@@ -227,6 +229,27 @@ pub async fn create_cert_test_server() -> CertTestContext {
             .expect("failed to parse certifier key");
     let certifier_wallet = MockWallet::new(certifier_key);
 
+    // The certifier's identity public key (compressed DER hex) — the server
+    // trusts exactly this certifier for certificate validation.
+    let certifier_identity_hex = certifier_wallet
+        .get_public_key(
+            GetPublicKeyArgs {
+                identity_key: true,
+                protocol_id: None,
+                key_id: None,
+                counterparty: None,
+                privileged: false,
+                privileged_reason: None,
+                for_self: None,
+                seek_permission: None,
+            },
+            None,
+        )
+        .await
+        .expect("failed to get certifier public key")
+        .public_key
+        .to_der_hex();
+
     // Decode the base64 certificate type to [u8; 32]
     let cert_type_b64 = "z40BOInXkI8m7f/wBrv4MJ09bZfzZbTj2fJqCtONqCY=";
     let cert_type_bytes = base64_decode_32(cert_type_b64);
@@ -299,11 +322,14 @@ pub async fn create_cert_test_server() -> CertTestContext {
         .wallet(server_wallet)
         .allow_unauthenticated(false)
         .certificates_to_request(certs_to_request)
+        .trusted_certifiers(vec![certifier_identity_hex])
         .on_certificates_received(on_certs_received)
         .build()
         .expect("failed to build cert middleware config");
 
-    let layer = AuthLayer::from_config(config, peer.clone(), transport.clone()).await;
+    let layer = AuthLayer::from_config(config, peer.clone(), transport.clone())
+        .await
+        .expect("failed to build cert auth layer");
 
     let certs_received_state = certs_received.clone();
 

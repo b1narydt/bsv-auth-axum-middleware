@@ -9,6 +9,8 @@ use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
+use bsv::wallet::interfaces::Certificate;
+
 /// Verified identity extracted from BRC-31 auth headers.
 ///
 /// Inserted into request extensions by the auth middleware. When
@@ -18,6 +20,13 @@ use axum::response::{IntoResponse, Response};
 pub struct Authenticated {
     /// Compressed hex public key of the authenticated caller.
     pub identity_key: String,
+    /// Validated certificates presented by the caller.
+    ///
+    /// Populated only when the middleware is certificate-gated (non-empty
+    /// `trusted_certifiers`): every certificate here has passed subject-bind,
+    /// certifier-PIN, type-PIN, and certifier-signature validation. Empty on
+    /// non-cert-gated paths and for `allow_unauthenticated` passthrough.
+    pub certificates: Vec<Certificate>,
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for Authenticated {

@@ -259,40 +259,83 @@ async fn test_cert_response_with_missing_certs_field_returns_400() {
 }
 
 /// Test 12 (TS cert test): Certificate request flow -- client requests certs
-/// from server during handshake.
+/// from server during handshake, while ALSO presenting its own certificate.
 ///
 /// NOTE: The TS test uses `sendCertificateRequest` which is a separate method.
 /// In the Rust SDK, certificate requests are configured via
 /// `set_requested_certificates` on AuthFetch, and the exchange happens during
 /// the handshake when both sides specify their requested certificates.
 ///
-/// This test verifies that when a client configures requested certificates
-/// and makes a request, the handshake includes the certificate request,
-/// and the server's certificates are exchanged.
+/// Security-posture note (CUSTODY-AUTH): the server is now *cert-gated*
+/// (non-empty `trusted_certifiers`), so certificate validation is MANDATORY for
+/// every authenticated route — including `/`. A client that presents a valid
+/// certificate from the trusted certifier is admitted (200); a client that
+/// presents none is blocked (that is the F1 fix, exercised by
+/// `cert_validation_tests`). This test therefore issues the client a valid
+/// certificate before asserting a 200, and still exercises the bidirectional
+/// exchange (client also requests the server's certificate).
 #[tokio::test]
 async fn test_cert_request_flow() {
     init_tracing();
     let ctx = create_cert_test_server().await;
     let base_url = &ctx.server_base_url;
 
-    // Create client wallet with random key
+    // Certifier (same fixed key the server trusts).
+    let certifier_key =
+        PrivateKey::from_hex("5a4d867377bd44eba1cecd0806c16f24e293f7e218c162b1177571edaeeaecef")
+            .expect("parse certifier key");
+    let certifier_wallet = MockWallet::new(certifier_key);
+
+    // Create client wallet with random key.
     let client_key = PrivateKey::from_random().expect("generate client key");
     let client_wallet = MockWallet::new(client_key);
 
-    // Create AuthFetch with certificate request configuration
-    let mut auth_fetch = AuthFetch::new(client_wallet);
+    let client_pub_key = client_wallet
+        .get_public_key(
+            GetPublicKeyArgs {
+                identity_key: true,
+                protocol_id: None,
+                key_id: None,
+                counterparty: None,
+                privileged: false,
+                privileged_reason: None,
+                for_self: None,
+                seek_permission: None,
+            },
+            None,
+        )
+        .await
+        .expect("get client public key")
+        .public_key;
 
-    // Configure certificates to request from the server
+    // Issue the client a valid certificate from the trusted certifier.
     let cert_type_b64 = "z40BOInXkI8m7f/wBrv4MJ09bZfzZbTj2fJqCtONqCY=";
+    let certificate_type = CertificateType(base64_decode_32(cert_type_b64));
+    let fields = HashMap::from([
+        ("firstName".to_string(), "Bob".to_string()),
+        ("lastName".to_string(), "Roe".to_string()),
+    ]);
+    let master_cert = MasterCertificate::issue_certificate_for_subject(
+        &certificate_type,
+        &client_pub_key,
+        fields,
+        &certifier_wallet,
+    )
+    .await
+    .expect("issue certificate for client");
+    client_wallet.add_master_certificate(master_cert).await;
+
+    // Create AuthFetch and also request the server's certificate (reverse dir).
+    let mut auth_fetch = AuthFetch::new(client_wallet);
     let mut requested = bsv::auth::types::RequestedCertificateSet::default();
     requested
         .types
         .insert(cert_type_b64.to_string(), vec!["firstName".to_string()]);
     auth_fetch.set_requested_certificates(requested);
 
-    // Make a request to trigger handshake + cert exchange
+    // Make a request to trigger handshake + bidirectional cert exchange.
     let url = format!("{base_url}/");
-    println!("[test_cert_request] GET {url} with requested certificates");
+    println!("[test_cert_request] GET {url} with requested certificates + client cert");
 
     let response = auth_fetch
         .fetch(&url, "GET", None, None)
@@ -300,16 +343,15 @@ async fn test_cert_request_flow() {
         .expect("auth fetch with cert request should succeed");
 
     println!("[test_cert_request] Response status: {}", response.status);
-    println!(
-        "[test_cert_request] Response body: {}",
-        String::from_utf8_lossy(&response.body)
-    );
 
-    // The request should succeed (200) since the root handler is not cert-gated
+    // Admitted on root because the client presented a valid, trusted cert.
     assert_eq!(response.status, 200, "expected 200 from root endpoint");
 
-    // The handshake should have completed with certificate exchange.
-    // We can verify by checking that the auth round-trip succeeded
-    // (which implies the handshake with certificate request completed).
+    // Server received (and validated) the client's certificate.
+    let received = ctx.certs_received.lock().await;
+    assert!(
+        !received.is_empty(),
+        "server should have received at least one validated certificate"
+    );
     println!("[test_cert_request] Certificate request flow completed successfully");
 }

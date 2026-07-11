@@ -11,7 +11,10 @@ pub mod middleware;
 pub mod payload;
 pub mod transport;
 
-pub use certificate::{certificate_listener_task, CertificateGate};
+pub use certificate::{
+    certificate_listener_task, validate_certificate, CertRejectReason, CertificateGate,
+    CertificateValidationPolicy,
+};
 pub use config::{AuthMiddlewareConfig, AuthMiddlewareConfigBuilder, OnCertificatesReceived};
 pub use error::AuthMiddlewareError;
 pub use extractor::Authenticated;

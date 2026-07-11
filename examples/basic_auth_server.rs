@@ -333,7 +333,9 @@ async fn main() -> std::io::Result<()> {
         .expect("failed to build middleware config");
 
     // Create the AuthLayer from config (async because it extracts Peer receivers).
-    let layer = AuthLayer::from_config(config, peer.clone(), transport.clone()).await;
+    let layer = AuthLayer::from_config(config, peer.clone(), transport.clone())
+        .await
+        .expect("failed to build auth layer");
 
     println!("Starting BRC-31 auth server on 127.0.0.1:8080");
 
