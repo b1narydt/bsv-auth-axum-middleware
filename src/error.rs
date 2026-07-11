@@ -102,6 +102,9 @@ impl axum::response::IntoResponse for AuthMiddlewareError {
                 | bsv::auth::AuthError::AuthFailed(_)
                 | bsv::auth::AuthError::InvalidSignature(_) => StatusCode::UNAUTHORIZED,
                 bsv::auth::AuthError::Timeout(_) => StatusCode::REQUEST_TIMEOUT,
+                // A replayed authenticated request is a client auth rejection,
+                // not a server fault — 401, not 500 (bsv-sdk 0.2.88 anti-replay).
+                bsv::auth::AuthError::ReplayDetected(_) => StatusCode::UNAUTHORIZED,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             },
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -114,6 +117,7 @@ impl axum::response::IntoResponse for AuthMiddlewareError {
                 bsv::auth::AuthError::AuthFailed(_) => "ERR_AUTH_FAILED",
                 bsv::auth::AuthError::InvalidSignature(_) => "ERR_INVALID_SIGNATURE",
                 bsv::auth::AuthError::Timeout(_) => "ERR_TIMEOUT",
+                bsv::auth::AuthError::ReplayDetected(_) => "ERR_REPLAY_DETECTED",
                 _ => "ERR_INTERNAL_SERVER_ERROR",
             },
             AuthMiddlewareError::Transport(_) => "ERR_TRANSPORT",
