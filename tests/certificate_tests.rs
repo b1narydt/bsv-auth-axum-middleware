@@ -109,6 +109,8 @@ async fn test_cert_protected_endpoint() {
         &client_pub_key_result.public_key,
         fields,
         &certifier_wallet,
+        bsv::auth::certificates::master::default_get_revocation_outpoint,
+        None,
     )
     .await
     .expect("issue certificate for client");
@@ -320,6 +322,8 @@ async fn test_cert_request_flow() {
         &client_pub_key,
         fields,
         &certifier_wallet,
+        bsv::auth::certificates::master::default_get_revocation_outpoint,
+        None,
     )
     .await
     .expect("issue certificate for client");

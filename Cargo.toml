@@ -1,6 +1,6 @@
 [package]
 name = "bsv-auth-axum-middleware"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.88"
 description = "BSV BRC-31 mutual authentication middleware for axum (port of bsv-auth-actix-middleware)"
@@ -27,7 +27,7 @@ name = "bsv_auth_axum_middleware"
 # BSV SDK — resolved from crates.io. Requires >=0.2.87 for the concurrency-safe
 # Arc<Peer> API (verify_general_message, &self handshake). Downstream consumers
 # should pin the same major.minor to avoid two-instance trait-bound conflicts.
-bsv-sdk = { version = "0.2.88", features = ["network"] }
+bsv-sdk = { version = "0.3", features = ["network"] }
 
 # Axum + tower
 axum = { version = "0.8", features = ["json"] }

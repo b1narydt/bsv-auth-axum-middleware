@@ -44,6 +44,8 @@ async fn issue_cert(
         subject_pubkey,
         fields,
         certifier,
+        bsv::auth::certificates::master::default_get_revocation_outpoint,
+        None,
     )
     .await
     .expect("issue cert");

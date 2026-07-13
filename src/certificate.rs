@@ -412,6 +412,12 @@ mod tests {
             subject,
             fields,
             certifier,
+            // bsv-sdk 0.2.89 restored the TS `getRevocationOutpoint(serial)`
+            // callback: the SDK does not mint a revocation token, the caller does.
+            // Test certs use the SDK default (the all-zeros sentinel = not
+            // revocable), which is fine here — nothing exercises revocation.
+            bsv::auth::certificates::master::default_get_revocation_outpoint,
+            None,
         )
         .await
         .unwrap()

@@ -283,6 +283,8 @@ pub async fn create_cert_test_server() -> CertTestContext {
         &server_pub_key_result.public_key,
         fields,
         &certifier_wallet,
+        bsv::auth::certificates::master::default_get_revocation_outpoint,
+        None,
     )
     .await
     .expect("failed to issue server certificate");
