@@ -2,7 +2,7 @@
 //!
 //! Provides `CertificateGate` for per-identity-key request gating (keyed on
 //! *validated-certificate presence*, never on mere session existence),
-//! `validate_certificate` for BRC-31 certificate validation, and
+//! `validate_certificate` for BRC-103/104 certificate validation, and
 //! `certificate_listener_task` for consuming certificate channels from the
 //! BSV SDK Peer and releasing the gate only after validation succeeds.
 //!

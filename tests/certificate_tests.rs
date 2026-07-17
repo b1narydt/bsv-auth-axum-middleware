@@ -1,4 +1,4 @@
-//! Certificate exchange integration tests for BRC-31 authentication middleware.
+//! Certificate exchange integration tests for BRC-103/104 authentication middleware.
 //!
 //! Tests validate the full certificate request/response flow using a test
 //! server configured with certificatesToRequest and a client MockWallet

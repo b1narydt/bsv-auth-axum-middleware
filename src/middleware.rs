@@ -1,4 +1,4 @@
-//! Core BRC-31 authentication middleware for axum.
+//! Core BRC-103/104 authentication middleware for axum.
 //!
 //! Implements the tower `Layer`/`Service` pattern to intercept all
 //! requests and handle three branches:
@@ -98,7 +98,7 @@ use crate::transport::ActixTransport;
 // AuthLayer (tower Layer)
 // ---------------------------------------------------------------------------
 
-/// Tower Layer that wraps services with BRC-31 authentication.
+/// Tower Layer that wraps services with BRC-103/104 authentication.
 ///
 /// Users register this via `.layer()` on their axum Router.
 #[derive(Clone)]
@@ -113,7 +113,7 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
     /// Create a new auth layer.
     ///
     /// # Arguments
-    /// * `peer` - Shared Peer instance for BRC-31 protocol processing.
+    /// * `peer` - Shared Peer instance for BRC-103/104 protocol processing.
     /// * `transport` - Channel-based transport for message correlation.
     /// * `allow_unauthenticated` - Whether to allow requests without auth headers.
     pub fn new(

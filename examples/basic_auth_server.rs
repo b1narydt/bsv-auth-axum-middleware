@@ -1,12 +1,12 @@
-//! Basic BRC-31 authentication server example.
+//! Basic BRC-103/104 authentication server example.
 //!
 //! Demonstrates how to set up an axum server with `AuthLayer::from_config`
-//! for mutual authentication using the BRC-31 Authrite protocol.
+//! for mutual authentication using the BRC-103/104 protocol.
 //!
 //! # Overview
 //!
 //! This example creates a minimal HTTP server on `127.0.0.1:8080` that requires
-//! BRC-31 authentication on all routes. It includes:
+//! BRC-103/104 authentication on all routes. It includes:
 //!
 //! - An `ExampleWallet` implementing `WalletInterface` (for demonstration only)
 //! - Server setup with `AuthLayer::from_config`
@@ -291,7 +291,7 @@ impl WalletInterface for ExampleWallet {
 // Route handlers
 // ---------------------------------------------------------------------------
 
-/// A protected handler that requires BRC-31 authentication.
+/// A protected handler that requires BRC-103/104 authentication.
 ///
 /// The `Authenticated` extractor provides access to the authenticated
 /// identity key of the caller.
@@ -320,7 +320,7 @@ async fn main() -> std::io::Result<()> {
     let server_key = PrivateKey::from_random().expect("failed to generate server key");
     let wallet = ExampleWallet::new(server_key);
 
-    // Create the transport and peer for BRC-31 protocol handling.
+    // Create the transport and peer for BRC-103/104 protocol handling.
     let transport = Arc::new(ActixTransport::new());
     let peer = Arc::new(Peer::new(wallet.clone(), transport.clone()));
 

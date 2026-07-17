@@ -1,4 +1,4 @@
-//! Request and response payload serialization for BRC-31 authentication.
+//! Request and response payload serialization for BRC-103/104 authentication.
 //!
 //! Provides a two-layer API:
 //! - **Pure layer:** Generic functions accepting `&str`, `&[u8]`, `&[(String, String)]`
@@ -39,7 +39,7 @@ pub(crate) fn write_varint_num(buf: &mut Vec<u8>, val: i64) {
 // Header filtering (pure layer)
 // ---------------------------------------------------------------------------
 
-/// Filter and sort request headers according to BRC-31 signing rules.
+/// Filter and sort request headers according to BRC-103/104 signing rules.
 pub fn filter_and_sort_request_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     let mut included: Vec<(String, String)> = headers
         .iter()
@@ -64,7 +64,7 @@ pub fn filter_and_sort_request_headers(headers: &[(String, String)]) -> Vec<(Str
     included
 }
 
-/// Filter and sort response headers according to BRC-31 signing rules.
+/// Filter and sort response headers according to BRC-103/104 signing rules.
 pub fn filter_and_sort_response_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     let mut included: Vec<(String, String)> = headers
         .iter()
@@ -88,7 +88,7 @@ pub fn filter_and_sort_response_headers(headers: &[(String, String)]) -> Vec<(St
 // Payload serialization (pure layer)
 // ---------------------------------------------------------------------------
 
-/// Serialize a request payload for BRC-31 signature verification.
+/// Serialize a request payload for BRC-103/104 signature verification.
 pub fn serialize_request_payload(
     request_nonce: &[u8],
     method: &str,
@@ -143,7 +143,7 @@ pub fn serialize_request_payload(
     buf
 }
 
-/// Serialize a response payload for BRC-31 signature verification.
+/// Serialize a response payload for BRC-103/104 signature verification.
 pub fn serialize_response_payload(
     request_nonce: &[u8],
     status_code: u16,

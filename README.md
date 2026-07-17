@@ -5,20 +5,25 @@
 [![CI](https://github.com/b1narydt/bsv-auth-axum-middleware/actions/workflows/ci.yml/badge.svg)](https://github.com/b1narydt/bsv-auth-axum-middleware/actions)
 [![License: Open BSV](https://img.shields.io/badge/license-Open%20BSV-blue.svg)](https://github.com/b1narydt/bsv-auth-axum-middleware/blob/main/LICENSE)
 
-BSV BRC-31 (Authrite) mutual authentication middleware for axum. This crate is a
+BSV BRC-104 (BRC-103 over HTTP) mutual authentication middleware for axum. This crate is a
 port of [`bsv-auth-actix-middleware`](https://crates.io/crates/bsv-auth-actix-middleware)
 to axum 0.8 + tower 0.5. The wire format, config surface, and error response
 bodies are identical to the actix sibling and to the TypeScript
 `@bsv/auth-express-middleware` reference implementation.
 
-## What is BRC-31?
+## What is BRC-103/104?
 
-[BRC-31](https://github.com/bitcoin-sv/BRCs/blob/master/peer-to-peer/0031.md)
-defines the Authrite mutual authentication protocol for BSV applications. It
-enables both client and server to prove their identity through public key
-cryptography without shared secrets or session cookies. Each request is signed
-by the sender and verified by the receiver, and each response is signed in
-return, providing end-to-end authentication for every HTTP exchange.
+[BRC-103](https://github.com/bitcoin-sv/BRCs/blob/master/peer-to-peer/0103.md)
+defines the transport-agnostic peer-to-peer mutual authentication and
+certificate exchange protocol for BSV applications, and
+[BRC-104](https://github.com/bitcoin-sv/BRCs/blob/master/transports/0104.md) is
+its HTTP binding — the `x-bsv-auth-*` headers and the `/.well-known/auth`
+handshake endpoint this middleware implements. (BRC-103/104 supersede the older
+BRC-31 "Authrite" protocol, which this stack does NOT speak.) It enables both
+client and server to prove their identity through public key cryptography
+without shared secrets or session cookies. Each request is signed by the sender
+and verified by the receiver, and each response is signed in return, providing
+end-to-end authentication for every HTTP exchange.
 
 The protocol is framework-agnostic: the same handshake and signature scheme works
 identically in the TypeScript Express middleware and in this Rust axum middleware.
@@ -113,7 +118,7 @@ let config = AuthMiddlewareConfigBuilder::new()
 
 ## Authentication Flow
 
-The middleware implements the full BRC-31 mutual authentication handshake:
+The middleware implements the full BRC-103/104 mutual authentication handshake:
 
 1. **Client initiates handshake** -- sends a request to `/.well-known/auth` with
    its public key and a nonce. The middleware responds with the server's public
@@ -135,7 +140,7 @@ The middleware implements the full BRC-31 mutual authentication handshake:
 
 ## Certificate Exchange
 
-For advanced identity verification, BRC-31 supports certificate exchange after
+For advanced identity verification, BRC-103/104 supports certificate exchange after
 the initial handshake. Use `CertificateGate` and the `certificates_to_request`
 configuration option to require specific certificates from peers:
 

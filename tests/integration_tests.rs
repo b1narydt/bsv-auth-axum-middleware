@@ -1,4 +1,4 @@
-//! Integration tests for BRC-31 authentication middleware.
+//! Integration tests for BRC-103/104 authentication middleware.
 //!
 //! Tests use axum test servers with sequential execution. Each test creates
 //! its own AuthFetch client instance (fresh client, matching the TS test pattern).

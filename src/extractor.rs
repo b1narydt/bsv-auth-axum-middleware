@@ -1,7 +1,7 @@
 //! Authenticated request extractor for downstream handlers.
 //!
 //! The `Authenticated` struct is inserted into request extensions by the auth
-//! middleware after successful BRC-31 signature verification. Handlers extract
+//! middleware after successful BRC-103/104 signature verification. Handlers extract
 //! it via axum's `FromRequestParts` trait.
 
 use axum::extract::FromRequestParts;
@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 
 use bsv::wallet::interfaces::Certificate;
 
-/// Verified identity extracted from BRC-31 auth headers.
+/// Verified identity extracted from BRC-103/104 auth headers.
 ///
 /// Inserted into request extensions by the auth middleware. When
 /// `allow_unauthenticated` is true and no auth headers are present,

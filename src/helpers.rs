@@ -1,4 +1,4 @@
-//! Helper functions for the BRC-31 auth middleware.
+//! Helper functions for the BRC-103/104 auth middleware.
 //!
 //! Provides header extraction, body reading, and AuthMessage construction
 //! utilities that the middleware will call.
