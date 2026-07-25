@@ -35,7 +35,7 @@ Add the following to your `Cargo.toml`:
 ```toml
 [dependencies]
 bsv-auth-axum-middleware = "0.1"
-bsv-sdk = { version = "0.2", features = ["network"] }
+bsv-sdk = { version = "0.3", features = ["network"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 ```
@@ -46,15 +46,17 @@ tokio = { version = "1", features = ["full"] }
 use std::sync::Arc;
 use axum::{Router, routing::post, response::IntoResponse, Json};
 use bsv::auth::peer::Peer;
-use bsv::wallet::ProtoWallet;
+use bsv::primitives::private_key::PrivateKey;
+use bsv::wallet::proto_wallet::ProtoWallet;
 use bsv_auth_axum_middleware::{
     AuthMiddlewareConfigBuilder, AuthLayer, Authenticated, ActixTransport,
 };
 
 #[tokio::main]
 async fn main() {
-    // 1. Create a wallet (ProtoWallet connects to a BRC-100 wallet service).
-    let wallet = ProtoWallet::new("http://localhost:3301").await.unwrap();
+    // 1. Create a wallet (ProtoWallet is an in-process key wallet; production
+    //    code implements WalletInterface over real key management).
+    let wallet = ProtoWallet::new(PrivateKey::from_random().unwrap());
 
     // 2. Build middleware configuration.
     let config = AuthMiddlewareConfigBuilder::new()
