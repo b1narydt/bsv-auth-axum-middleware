@@ -27,7 +27,7 @@ name = "bsv_auth_axum_middleware"
 # BSV SDK — resolved from crates.io. Requires >=0.2.87 for the concurrency-safe
 # Arc<Peer> API (verify_general_message, &self handshake). Downstream consumers
 # should pin the same major.minor to avoid two-instance trait-bound conflicts.
-bsv-sdk = { version = "0.4", features = ["network"] }
+bsv-sdk = { version = "0.5", features = ["network"] }
 
 # Axum + tower
 axum = { version = "0.8", features = ["json"] }
