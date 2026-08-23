@@ -194,7 +194,10 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
             requested.certifiers = config.trusted_certifiers.clone();
             let policy = Arc::new(CertificateValidationPolicy {
                 trusted_certifiers: config.trusted_certifiers.clone(),
-                requested_types: requested.types.clone(),
+                // The SDK models requested types as an IndexMap so signed
+                // certificate payloads re-serialise in wire order. This policy
+                // only does lookups, so ordering is immaterial here.
+                requested_types: requested.types.clone().into_iter().collect(),
             });
 
             peer.set_certificates_to_request(requested);
