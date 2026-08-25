@@ -26,7 +26,7 @@ name = "bsv_auth_axum_middleware"
 [dependencies]
 # BSV SDK 0.8 uses a background receive task and preserves certificate keyrings
 # in VerifiableCertificate. Repoint this path to the published release separately.
-bsv-sdk = { path = "/Users/donot/PARAGON/PARAGON-code/bsv-sdk-recv", features = ["network"] }
+bsv-sdk = { version = "0.8.0", features = ["network"] }
 
 # Axum + tower
 axum = { version = "0.8", features = ["json"] }
