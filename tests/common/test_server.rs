@@ -4,7 +4,6 @@
 //! to a random OS port, returns its base URL, and is torn down when the
 //! returned handle is dropped (or the test process exits for leaked servers).
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -20,12 +19,14 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use bsv::auth::certificates::master::MasterCertificate;
+use bsv::auth::certificates::VerifiableCertificate;
 use bsv::auth::peer::Peer;
 use bsv::primitives::private_key::PrivateKey;
-use bsv::wallet::interfaces::{Certificate, CertificateType, GetPublicKeyArgs, WalletInterface};
+use bsv::wallet::interfaces::{CertificateType, GetPublicKeyArgs, WalletInterface};
 use bsv_auth_axum_middleware::{
     ActixTransport, AuthLayer, AuthMiddlewareConfigBuilder, Authenticated, OnCertificatesReceived,
 };
+use indexmap::IndexMap;
 
 use super::mock_wallet::MockWallet;
 
@@ -206,7 +207,7 @@ pub struct CertTestContext {
     /// Base URL of the cert test server (e.g., "http://127.0.0.1:54321").
     pub server_base_url: String,
     /// Shared storage for certificates received via the onCertificatesReceived callback.
-    pub certs_received: Arc<tokio::sync::Mutex<Vec<Certificate>>>,
+    pub certs_received: Arc<tokio::sync::Mutex<Vec<VerifiableCertificate>>>,
 }
 
 /// Create a certificate-protected axum test server mirroring actix create_cert_test_server.
@@ -255,7 +256,7 @@ pub async fn create_cert_test_server() -> CertTestContext {
     let cert_type_bytes = base64_decode_32(cert_type_b64);
     let certificate_type = CertificateType(cert_type_bytes);
 
-    let fields = HashMap::from([
+    let fields = IndexMap::from([
         ("firstName".to_string(), "Alice".to_string()),
         ("lastName".to_string(), "Doe".to_string()),
     ]);
@@ -299,12 +300,12 @@ pub async fn create_cert_test_server() -> CertTestContext {
         .insert(cert_type_b64.to_string(), vec!["firstName".to_string()]);
 
     // Shared storage for received certificates
-    let certs_received = Arc::new(tokio::sync::Mutex::new(Vec::<Certificate>::new()));
+    let certs_received = Arc::new(tokio::sync::Mutex::new(Vec::<VerifiableCertificate>::new()));
     let certs_received_cb = certs_received.clone();
 
     // Build the onCertificatesReceived callback
-    let on_certs_received: OnCertificatesReceived =
-        Box::new(move |sender_key: String, certs: Vec<Certificate>| {
+    let on_certs_received: OnCertificatesReceived = Box::new(
+        move |sender_key: String, certs: Vec<VerifiableCertificate>| {
             let certs_store = certs_received_cb.clone();
             Box::pin(async move {
                 println!(
@@ -315,7 +316,8 @@ pub async fn create_cert_test_server() -> CertTestContext {
                 let mut store = certs_store.lock().await;
                 store.extend(certs);
             })
-        });
+        },
+    );
 
     let transport = Arc::new(ActixTransport::new());
     let peer = Arc::new(Peer::new(server_wallet.clone(), transport.clone()));
@@ -377,7 +379,7 @@ pub async fn create_cert_test_server() -> CertTestContext {
 /// then checks if any certificates were received. Returns 200 if yes, 401 if no.
 async fn handler_cert_protected(
     _auth: Authenticated,
-    State(certs): State<Arc<tokio::sync::Mutex<Vec<Certificate>>>>,
+    State(certs): State<Arc<tokio::sync::Mutex<Vec<VerifiableCertificate>>>>,
     body: Bytes,
 ) -> impl IntoResponse {
     println!(

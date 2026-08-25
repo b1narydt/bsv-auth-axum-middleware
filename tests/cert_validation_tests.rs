@@ -13,10 +13,12 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bsv::auth::certificates::master::MasterCertificate;
+use bsv::auth::certificates::VerifiableCertificate;
 use bsv::primitives::private_key::PrivateKey;
 use bsv::primitives::public_key::PublicKey;
 use bsv::wallet::interfaces::{Certificate, CertificateType};
 use bsv::wallet::proto_wallet::ProtoWallet;
+use indexmap::IndexMap;
 
 use bsv_auth_axum_middleware::certificate::{
     certificate_listener_task, validate_certificate, CertRejectReason, CertificateGate,
@@ -37,7 +39,7 @@ async fn issue_cert(
     subject_pubkey: &PublicKey,
     cert_type: [u8; 32],
 ) -> Certificate {
-    let mut fields = HashMap::new();
+    let mut fields = IndexMap::new();
     fields.insert("firstName".to_string(), "Alice".to_string());
     let mc = MasterCertificate::issue_certificate_for_subject(
         &CertificateType(cert_type),
@@ -52,7 +54,10 @@ async fn issue_cert(
     mc.certificate.clone()
 }
 
-fn policy(trusted: Vec<String>, types: HashMap<String, Vec<String>>) -> CertificateValidationPolicy {
+fn policy(
+    trusted: Vec<String>,
+    types: HashMap<String, Vec<String>>,
+) -> CertificateValidationPolicy {
     CertificateValidationPolicy {
         trusted_certifiers: trusted,
         requested_types: types,
@@ -63,12 +68,12 @@ fn policy(trusted: Vec<String>, types: HashMap<String, Vec<String>>) -> Certific
 /// Registers a waiter for `sender` first so the release path is exercised.
 async fn run_listener_once(
     sender: &str,
-    certs: Vec<Certificate>,
+    certs: Vec<VerifiableCertificate>,
     policy: CertificateValidationPolicy,
 ) -> CertificateGate {
     let gate = CertificateGate::new();
     let _notify = gate.register(sender);
-    let (cert_tx, cert_rx) = mpsc::channel(8);
+    let (cert_tx, cert_rx) = mpsc::unbounded_channel();
     let (_req_tx, req_rx) = mpsc::channel::<(String, RequestedCertificateSet)>(8);
 
     let task = tokio::spawn(certificate_listener_task(
@@ -79,7 +84,7 @@ async fn run_listener_once(
         None,
     ));
 
-    cert_tx.send((sender.to_string(), certs)).await.unwrap();
+    cert_tx.send((sender.to_string(), certs)).unwrap();
     // Give the listener time to validate + (maybe) release.
     tokio::time::sleep(Duration::from_millis(80)).await;
 
@@ -102,7 +107,10 @@ async fn test_untrusted_certifier_is_rejected() {
     let cert = issue_cert(&certifier, &subject_pub, [5u8; 32]).await;
 
     // Trusted set contains a DIFFERENT certifier.
-    let other = PrivateKey::from_random().unwrap().to_public_key().to_der_hex();
+    let other = PrivateKey::from_random()
+        .unwrap()
+        .to_public_key()
+        .to_der_hex();
     let pol = policy(vec![other], HashMap::new());
     let verifier = ProtoWallet::anyone();
 
@@ -110,7 +118,12 @@ async fn test_untrusted_certifier_is_rejected() {
     assert_eq!(res, Err(CertRejectReason::UntrustedCertifier));
 
     // And through the listener: the gate must NOT be released.
-    let gate = run_listener_once(&sender, vec![cert], pol).await;
+    let gate = run_listener_once(
+        &sender,
+        vec![VerifiableCertificate::new(cert, IndexMap::new())],
+        pol,
+    )
+    .await;
     assert!(
         gate.validated_for(&sender).is_none(),
         "untrusted certifier must not release the gate"
@@ -129,7 +142,10 @@ async fn test_subject_bind_mismatch_is_rejected() {
     let cert = issue_cert(&certifier, &subject_pub, [6u8; 32]).await;
 
     // Sender identity differs from the certificate subject.
-    let wrong_sender = PrivateKey::from_random().unwrap().to_public_key().to_der_hex();
+    let wrong_sender = PrivateKey::from_random()
+        .unwrap()
+        .to_public_key()
+        .to_der_hex();
     let trusted = vec![certifier_hex(&certifier).await];
     let pol = policy(trusted, HashMap::new());
     let verifier = ProtoWallet::anyone();
@@ -137,7 +153,12 @@ async fn test_subject_bind_mismatch_is_rejected() {
     let res = validate_certificate(&cert, &wrong_sender, &pol, &verifier).await;
     assert_eq!(res, Err(CertRejectReason::SubjectMismatch));
 
-    let gate = run_listener_once(&wrong_sender, vec![cert], pol).await;
+    let gate = run_listener_once(
+        &wrong_sender,
+        vec![VerifiableCertificate::new(cert, IndexMap::new())],
+        pol,
+    )
+    .await;
     assert!(gate.validated_for(&wrong_sender).is_none());
 }
 
@@ -167,7 +188,12 @@ async fn test_bad_certifier_signature_is_rejected() {
     let res = validate_certificate(&cert, &sender, &pol, &verifier).await;
     assert_eq!(res, Err(CertRejectReason::BadSignature));
 
-    let gate = run_listener_once(&sender, vec![cert], pol).await;
+    let gate = run_listener_once(
+        &sender,
+        vec![VerifiableCertificate::new(cert, IndexMap::new())],
+        pol,
+    )
+    .await;
     assert!(gate.validated_for(&sender).is_none());
 }
 
@@ -190,7 +216,12 @@ async fn test_valid_trusted_cert_releases_and_surfaces() {
     let res = validate_certificate(&cert, &sender, &pol, &verifier).await;
     assert_eq!(res, Ok(()));
 
-    let gate = run_listener_once(&sender, vec![cert.clone()], pol).await;
+    let gate = run_listener_once(
+        &sender,
+        vec![VerifiableCertificate::new(cert.clone(), IndexMap::new())],
+        pol,
+    )
+    .await;
     let surfaced = gate
         .validated_for(&sender)
         .expect("valid cert must release the gate and be surfaced");
@@ -235,11 +266,16 @@ async fn test_empty_trusted_set_means_gate_not_engaged() {
 
     let transport = std::sync::Arc::new(ActixTransport::new());
     let wallet = common::mock_wallet::MockWallet::new(PrivateKey::from_random().unwrap());
-    let peer = std::sync::Arc::new(bsv::auth::peer::Peer::new(wallet.clone(), transport.clone()));
+    let peer = std::sync::Arc::new(bsv::auth::peer::Peer::new(
+        wallet.clone(),
+        transport.clone(),
+    ));
 
     // No trusted_certifiers configured -> no cert gate, even with types set.
     let mut certs = RequestedCertificateSet::default();
-    certs.types.insert("someType".to_string(), vec!["f".to_string()]);
+    certs
+        .types
+        .insert("someType".to_string(), vec!["f".to_string()]);
     let config = AuthMiddlewareConfigBuilder::new()
         .wallet(wallet)
         .certificates_to_request(certs)
@@ -265,7 +301,10 @@ async fn test_f1_session_without_valid_cert_does_not_pass() {
     // but no validated certificate is ever recorded. Prior to the fix the gate
     // released on session existence; now it must stay closed.
     let gate = CertificateGate::new();
-    let self_identity = PrivateKey::from_random().unwrap().to_public_key().to_der_hex();
+    let self_identity = PrivateKey::from_random()
+        .unwrap()
+        .to_public_key()
+        .to_der_hex();
 
     let notify = gate.register(&self_identity);
 

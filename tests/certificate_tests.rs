@@ -16,6 +16,7 @@ use bsv::auth::certificates::master::MasterCertificate;
 use bsv::auth::clients::AuthFetch;
 use bsv::primitives::private_key::PrivateKey;
 use bsv::wallet::interfaces::{CertificateType, GetPublicKeyArgs, WalletInterface};
+use indexmap::IndexMap;
 
 use std::collections::HashMap;
 use std::sync::Once;
@@ -99,7 +100,7 @@ async fn test_cert_protected_endpoint() {
     // Issue MasterCertificate for client using certifier wallet
     let cert_type_b64 = "z40BOInXkI8m7f/wBrv4MJ09bZfzZbTj2fJqCtONqCY=";
     let certificate_type = CertificateType(base64_decode_32(cert_type_b64));
-    let fields = HashMap::from([
+    let fields = IndexMap::from([
         ("firstName".to_string(), "Alice".to_string()),
         ("lastName".to_string(), "Doe".to_string()),
     ]);
@@ -313,7 +314,7 @@ async fn test_cert_request_flow() {
     // Issue the client a valid certificate from the trusted certifier.
     let cert_type_b64 = "z40BOInXkI8m7f/wBrv4MJ09bZfzZbTj2fJqCtONqCY=";
     let certificate_type = CertificateType(base64_decode_32(cert_type_b64));
-    let fields = HashMap::from([
+    let fields = IndexMap::from([
         ("firstName".to_string(), "Bob".to_string()),
         ("lastName".to_string(), "Roe".to_string()),
     ]);

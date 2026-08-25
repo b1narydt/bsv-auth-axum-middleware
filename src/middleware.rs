@@ -23,7 +23,9 @@ use tracing::{debug, error, warn};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use bsv::auth::peer::Peer;
+use bsv::auth::certificates::VerifiableCertificate;
+use bsv::auth::error::AuthError;
+use bsv::auth::peer::{OnCertificatesReceived as PeerOnCertificatesReceived, Peer};
 use bsv::auth::types::{AuthMessage, MessageType};
 use bsv::wallet::interfaces::WalletInterface;
 
@@ -152,7 +154,8 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
     ///    via the Peer's `RequestedCertificateSet`, so clients offer matching
     ///    certificates and the SDK actually drives the cert exchange (the SDK
     ///    short-circuits on an empty `certifiers` list).
-    /// 2. Takes the certificate receivers from the Peer (one-shot take).
+    /// 2. Registers a certificate callback and takes the certificate-request
+    ///    receiver from the Peer (one-shot take).
     /// 3. Spawns a background `certificate_listener_task` that VALIDATES each
     ///    incoming certificate (subject-bind + certifier-PIN + type-PIN +
     ///    certifier-signature) and releases the per-identity gate only on
@@ -201,21 +204,31 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
             });
 
             peer.set_certificates_to_request(requested);
-            let cert_rx = peer.on_certificates();
             let cert_req_rx = peer.on_certificate_request();
 
-            if cert_rx.is_none() {
-                warn!("Peer::on_certificates() returned None -- receiver already taken");
-            }
             if cert_req_rx.is_none() {
                 warn!("Peer::on_certificate_request() returned None -- receiver already taken");
             }
 
-            match (cert_rx, cert_req_rx) {
-                (Some(cert_rx), Some(cert_req_rx)) => {
+            match cert_req_rx {
+                Some(cert_req_rx) => {
                     let gate = crate::certificate::CertificateGate::new();
                     let gate_clone = gate.clone();
                     let callback = config.on_certificates_received.clone();
+                    let (cert_tx, cert_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let certificate_forwarder: Arc<PeerOnCertificatesReceived> =
+                        Arc::new(move |sender_key, certificates| {
+                            let cert_tx = cert_tx.clone();
+                            Box::pin(async move {
+                                cert_tx.send((sender_key, certificates)).map_err(|_| {
+                                    AuthError::TransportNotConnected(
+                                        "middleware certificate listener channel closed"
+                                            .to_string(),
+                                    )
+                                })
+                            })
+                        });
+                    peer.listen_for_certificates_received(certificate_forwarder);
                     tokio::spawn(crate::certificate::certificate_listener_task(
                         cert_rx,
                         cert_req_rx,
@@ -226,8 +239,8 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
                     debug!("certificate listener task spawned (validation enforced)");
                     Some(gate)
                 }
-                _ => {
-                    warn!("certificate exchange configured but receivers unavailable -- gate disabled");
+                None => {
+                    warn!("certificate exchange configured but certificate-request receiver unavailable -- gate disabled");
                     None
                 }
             }
@@ -302,7 +315,7 @@ where
             // Branch 1: Handshake at /.well-known/auth
             if path == "/.well-known/auth" {
                 debug!("BRC-31 handshake request at /.well-known/auth");
-                return Ok(handle_handshake(req, peer, transport).await);
+                return Ok(handle_handshake(req, transport).await);
             }
 
             // Check for auth headers
@@ -344,10 +357,9 @@ where
                     //
                     // HOT PATH: lock-free, fully concurrent. `verify_general_message`
                     // takes only a SessionManager read lock and does NOT call
-                    // `process_pending` or touch the transport `pending` map, so
+                    // touch the transport `pending` map, so
                     // concurrent general requests on one session verify in parallel
-                    // and never drain each other's handshake replies. The handshake
-                    // path (Branch 1) is the only caller of `process_pending`.
+                    // and never drain each other's handshake replies.
                     if let Err(e) = peer.verify_general_message(auth_msg).await {
                         warn!("Signature verification failed: {}", e);
                         return Ok(AuthMiddlewareError::BsvSdk(e).into_response());
@@ -369,7 +381,7 @@ where
                     // BEFORE checking the validated-cert store, so a release that
                     // lands between the check and the await still wakes us. If the
                     // certs are already present we skip the wait entirely.
-                    let mut validated_certs: Vec<bsv::wallet::interfaces::Certificate> = Vec::new();
+                    let mut validated_certs: Vec<VerifiableCertificate> = Vec::new();
                     if let Some(ref gate) = certificate_gate {
                         let notify = gate.register(&headers.identity_key);
                         let notified = notify.notified();
@@ -386,7 +398,9 @@ where
                                     .is_err()
                                 {
                                     warn!(identity_key = %headers.identity_key, "certificate validation timed out");
-                                    return Ok(AuthMiddlewareError::CertificateTimeout.into_response());
+                                    return Ok(
+                                        AuthMiddlewareError::CertificateTimeout.into_response()
+                                    );
                                 }
                                 match gate.validated_for(&headers.identity_key) {
                                     Some(certs) => validated_certs = certs,
@@ -394,7 +408,9 @@ where
                                         // Woken without validated certs => no valid
                                         // certificate was presented. Reject.
                                         warn!(identity_key = %headers.identity_key, "no valid certificate presented -- rejecting cert-gated request");
-                                        return Ok(AuthMiddlewareError::CertificateTimeout.into_response());
+                                        return Ok(
+                                            AuthMiddlewareError::CertificateTimeout.into_response()
+                                        );
                                     }
                                 }
                             }
@@ -439,14 +455,7 @@ where
 // Handshake handler
 // ---------------------------------------------------------------------------
 
-async fn handle_handshake<W>(
-    req: Request<Body>,
-    peer: Arc<Peer<W>>,
-    transport: Arc<ActixTransport>,
-) -> Response<Body>
-where
-    W: WalletInterface + 'static,
-{
+async fn handle_handshake(req: Request<Body>, transport: Arc<ActixTransport>) -> Response<Body> {
     // Read body
     let body_bytes = match req.into_body().collect().await {
         Ok(c) => c.to_bytes(),
@@ -529,12 +538,8 @@ where
                 error!("Failed to feed certificate message: {}", e);
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
-            // HANDSHAKE/CERT path: the Peer serializes `process_pending`
-            // internally on its own handshake mutex, so no outer Mutex is
-            // needed and general-message verifies are not blocked.
-            if let Err(e) = peer.process_pending().await {
-                error!("Peer processing failed for certificate: {}", e);
-            }
+            // Peer owns the receive task; the pre-registered transport waiter
+            // resolves when that background task emits the correlated reply.
 
             // Short timeout: if the Peer emits a signed outgoing response
             // for this correlation key, deliver it with the full signed
@@ -569,13 +574,8 @@ where
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    // HANDSHAKE path: `process_pending` serializes internally on the Peer's
-    // own handshake mutex; no outer Mutex needed and general verifies run
-    // concurrently.
-    if let Err(e) = peer.process_pending().await {
-        error!("Peer processing failed during handshake: {}", e);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    // Peer owns the receive task; the pre-registered transport waiter resolves
+    // when that background task emits the correlated handshake reply.
 
     // Wait for signed response
     let response_msg = match tokio::time::timeout(Duration::from_secs(30), rx).await {

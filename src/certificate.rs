@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use bsv::auth::certificates::AuthCertificate;
+use bsv::auth::certificates::{AuthCertificate, VerifiableCertificate};
 use bsv::auth::types::RequestedCertificateSet;
 use bsv::primitives::public_key::PublicKey;
 use bsv::wallet::interfaces::Certificate;
@@ -149,7 +149,7 @@ pub async fn validate_certificate(
 #[derive(Clone)]
 pub struct CertificateGate {
     pending: Arc<DashMap<String, Arc<Notify>>>,
-    validated: Arc<DashMap<String, Vec<Certificate>>>,
+    validated: Arc<DashMap<String, Vec<VerifiableCertificate>>>,
 }
 
 impl CertificateGate {
@@ -176,7 +176,7 @@ impl CertificateGate {
     /// This is the ONLY path that authorises a cert-gated identity. Call it only
     /// after every certificate for `identity_key` has passed
     /// [`validate_certificate`].
-    pub fn mark_validated(&self, identity_key: &str, certs: Vec<Certificate>) {
+    pub fn mark_validated(&self, identity_key: &str, certs: Vec<VerifiableCertificate>) {
         self.validated.insert(identity_key.to_string(), certs);
         if let Some((_, notify)) = self.pending.remove(identity_key) {
             notify.notify_waiters();
@@ -184,7 +184,7 @@ impl CertificateGate {
     }
 
     /// The validated certificates recorded for an identity, if any.
-    pub fn validated_for(&self, identity_key: &str) -> Option<Vec<Certificate>> {
+    pub fn validated_for(&self, identity_key: &str) -> Option<Vec<VerifiableCertificate>> {
         self.validated.get(identity_key).map(|e| e.value().clone())
     }
 
@@ -226,7 +226,7 @@ impl Default for CertificateGate {
 ///
 /// Exits when both channels are closed.
 pub async fn certificate_listener_task(
-    mut cert_rx: mpsc::Receiver<(String, Vec<Certificate>)>,
+    mut cert_rx: mpsc::UnboundedReceiver<(String, Vec<VerifiableCertificate>)>,
     mut cert_req_rx: mpsc::Receiver<(String, RequestedCertificateSet)>,
     gate: CertificateGate,
     policy: Arc<CertificateValidationPolicy>,
@@ -328,9 +328,8 @@ mod tests {
 
     use bsv::auth::certificates::master::MasterCertificate;
     use bsv::primitives::private_key::PrivateKey;
-    use bsv::wallet::interfaces::{
-        CertificateType, GetPublicKeyArgs, WalletInterface,
-    };
+    use bsv::wallet::interfaces::{CertificateType, GetPublicKeyArgs, WalletInterface};
+    use indexmap::IndexMap;
 
     // -- gate mechanics --------------------------------------------------
 
@@ -404,10 +403,10 @@ mod tests {
         certifier: &ProtoWallet,
         subject: &PublicKey,
         cert_type: [u8; 32],
-    ) -> Certificate {
-        let mut fields = HashMap::new();
+    ) -> VerifiableCertificate {
+        let mut fields = IndexMap::new();
         fields.insert("firstName".to_string(), "Alice".to_string());
-        MasterCertificate::issue_certificate_for_subject(
+        let certificate = MasterCertificate::issue_certificate_for_subject(
             &CertificateType(cert_type),
             subject,
             fields,
@@ -422,7 +421,8 @@ mod tests {
         .await
         .unwrap()
         .certificate
-        .clone()
+        .clone();
+        VerifiableCertificate::new(certificate, IndexMap::new())
     }
 
     #[tokio::test]
@@ -492,7 +492,7 @@ mod tests {
 
         let gate = CertificateGate::new();
         let _n = gate.register(&sender);
-        let (cert_tx, cert_rx) = mpsc::channel(8);
+        let (cert_tx, cert_rx) = mpsc::unbounded_channel();
         let (_req_tx, req_rx) = mpsc::channel::<(String, RequestedCertificateSet)>(8);
 
         let task = tokio::spawn(certificate_listener_task(
@@ -503,7 +503,7 @@ mod tests {
             None,
         ));
 
-        cert_tx.send((sender.clone(), vec![cert])).await.unwrap();
+        cert_tx.send((sender.clone(), vec![cert])).unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(gate.validated_for(&sender).is_some());
 
@@ -520,7 +520,7 @@ mod tests {
         });
         let gate = CertificateGate::new();
         let _n = gate.register("sender_1");
-        let (cert_tx, cert_rx) = mpsc::channel(8);
+        let (cert_tx, cert_rx) = mpsc::unbounded_channel();
         let (_req_tx, req_rx) = mpsc::channel::<(String, RequestedCertificateSet)>(8);
 
         let task = tokio::spawn(certificate_listener_task(
@@ -531,7 +531,7 @@ mod tests {
             None,
         ));
 
-        cert_tx.send(("sender_1".to_string(), vec![])).await.unwrap();
+        cert_tx.send(("sender_1".to_string(), vec![])).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             gate.validated_for("sender_1").is_none(),
@@ -565,7 +565,7 @@ mod tests {
         });
         let gate = CertificateGate::new();
         let _n = gate.register(&sender);
-        let (cert_tx, cert_rx) = mpsc::channel(8);
+        let (cert_tx, cert_rx) = mpsc::unbounded_channel();
         let (_req_tx, req_rx) = mpsc::channel::<(String, RequestedCertificateSet)>(8);
 
         let task = tokio::spawn(certificate_listener_task(
@@ -576,9 +576,12 @@ mod tests {
             Some(Arc::new(callback)),
         ));
 
-        cert_tx.send((sender.clone(), vec![cert])).await.unwrap();
+        cert_tx.send((sender.clone(), vec![cert])).unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
-        assert!(called.load(Ordering::SeqCst), "callback should fire on validated certs");
+        assert!(
+            called.load(Ordering::SeqCst),
+            "callback should fire on validated certs"
+        );
 
         drop(cert_tx);
         drop(_req_tx);
@@ -588,13 +591,16 @@ mod tests {
     #[tokio::test]
     async fn test_listener_exits_when_channels_close() {
         let gate = CertificateGate::new();
-        let (cert_tx, cert_rx) = mpsc::channel::<(String, Vec<Certificate>)>(8);
-        let (cert_req_tx, cert_req_rx) =
-            mpsc::channel::<(String, RequestedCertificateSet)>(8);
+        let (cert_tx, cert_rx) = mpsc::unbounded_channel::<(String, Vec<VerifiableCertificate>)>();
+        let (cert_req_tx, cert_req_rx) = mpsc::channel::<(String, RequestedCertificateSet)>(8);
         let pol = Arc::new(CertificateValidationPolicy::default());
 
         let task = tokio::spawn(certificate_listener_task(
-            cert_rx, cert_req_rx, gate, pol, None,
+            cert_rx,
+            cert_req_rx,
+            gate,
+            pol,
+            None,
         ));
 
         drop(cert_tx);

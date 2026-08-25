@@ -9,7 +9,7 @@ use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use bsv::wallet::interfaces::Certificate;
+use bsv::auth::certificates::VerifiableCertificate;
 
 /// Verified identity extracted from BRC-103/104 auth headers.
 ///
@@ -26,7 +26,7 @@ pub struct Authenticated {
     /// `trusted_certifiers`): every certificate here has passed subject-bind,
     /// certifier-PIN, type-PIN, and certifier-signature validation. Empty on
     /// non-cert-gated paths and for `allow_unauthenticated` passthrough.
-    pub certificates: Vec<Certificate>,
+    pub certificates: Vec<VerifiableCertificate>,
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for Authenticated {

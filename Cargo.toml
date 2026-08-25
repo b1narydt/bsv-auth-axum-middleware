@@ -24,10 +24,9 @@ name = "bsv_auth_axum_middleware"
 [workspace]
 
 [dependencies]
-# BSV SDK — resolved from crates.io. Requires >=0.2.87 for the concurrency-safe
-# Arc<Peer> API (verify_general_message, &self handshake). Downstream consumers
-# should pin the same major.minor to avoid two-instance trait-bound conflicts.
-bsv-sdk = { version = "0.7.1", features = ["network"] }
+# BSV SDK 0.8 uses a background receive task and preserves certificate keyrings
+# in VerifiableCertificate. Repoint this path to the published release separately.
+bsv-sdk = { path = "/Users/donot/PARAGON/PARAGON-code/bsv-sdk-recv", features = ["network"] }
 
 # Axum + tower
 axum = { version = "0.8", features = ["json"] }
@@ -55,6 +54,8 @@ tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 
 # Certificate gating
 dashmap = "6.1"
+# bsv-sdk uses IndexMap in signing preimages but does not re-export it.
+indexmap = "2"
 
 [dev-dependencies]
 tokio = { version = "1.51", features = ["full"] }

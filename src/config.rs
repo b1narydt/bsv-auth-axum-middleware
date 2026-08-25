@@ -6,9 +6,10 @@
 
 use std::sync::Arc;
 
+use bsv::auth::certificates::VerifiableCertificate;
 use bsv::auth::session_manager::SessionManager;
 use bsv::auth::types::RequestedCertificateSet;
-use bsv::wallet::interfaces::{Certificate, WalletInterface};
+use bsv::wallet::interfaces::WalletInterface;
 use futures_util::future::BoxFuture;
 
 use crate::error::AuthMiddlewareError;
@@ -18,7 +19,7 @@ use crate::error::AuthMiddlewareError;
 /// Receives `(sender_identity_key, certificates)`. The callback is invoked
 /// fire-and-forget: panics are caught and logged but do not affect request flow.
 pub type OnCertificatesReceived =
-    Box<dyn Fn(String, Vec<Certificate>) -> BoxFuture<'static, ()> + Send + Sync>;
+    Box<dyn Fn(String, Vec<VerifiableCertificate>) -> BoxFuture<'static, ()> + Send + Sync>;
 
 impl<W: WalletInterface> std::fmt::Debug for AuthMiddlewareConfig<W> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
