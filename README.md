@@ -168,10 +168,18 @@ let config = AuthMiddlewareConfigBuilder::new()
 Configure a nonempty `trusted_certifiers` set to engage certificate gating.
 The well-known handler awaits SDK proof validation against the exact local
 session and its retained request, validates issuer/type/subject/signature policy,
-and stores the first accepted batch immutably for that session. A new credential
+requires each proof keyring to match the exact retained field set (no missing,
+substituted or extra fields), and stores the first accepted batch immutably for
+that session. The empty-field case requires an empty keyring. A new credential
 requires a new handshake. General HTTP requests read only that exact session's
 batch, so simultaneous sessions with the same wallet key cannot borrow each
 other's certificates. Nonempty-field proofs remain supported.
+
+Session records are pruned against the SDK's active-session lookup before new
+record insertion and every second while the middleware is running. This honors
+SDK cap eviction and idle expiry even without later HTTP traffic. The pruning
+task holds only a weak peer reference and stops after that peer is dropped;
+expired records never supply HTTP authority while awaiting the next sweep.
 
 `Authenticated` retains its two-field public shape; `certificates` now means the
 batch proved by this exact request's authenticated BRC session. A separate

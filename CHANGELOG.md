@@ -2,6 +2,10 @@
 
 - Bind HTTP certificate authority to the exact authenticated local BRC session,
   not the wallet identity shared by concurrent sessions.
+- Enforce exact retained disclosure fields, including rejecting missing,
+  substituted or extra valid keys; preserve empty-field/empty-keyring proofs.
+- Prune session batches on admission and periodically against SDK active
+  sessions, honoring cap eviction and idle expiry without an SDK API change.
 - Await SDK proof validation and retained-request checks before recording the
   first immutable session batch; replacement credentials require reconnect.
 - Preserve `Authenticated` and legacy identity observation APIs; expose separate

@@ -380,3 +380,222 @@ async fn hostile_frames_and_late_identity_callbacks_cannot_replace_session_autho
     );
     task.abort();
 }
+
+#[tokio::test]
+async fn retained_nonempty_fields_reject_missing_substituted_and_extra_proofs() {
+    use bsv::auth::certificates::VerifiableCertificate;
+    let issuer_key = PrivateKey::from_random().unwrap();
+    let issuer_id = issuer_key.to_public_key().to_der_hex();
+    let issuer = MockWallet::new(issuer_key);
+    let key = PrivateKey::from_random().unwrap();
+    let subject = key.to_public_key();
+    let holder = subject.to_der_hex();
+    let wallet = MockWallet::new(key);
+    let master = MasterCertificate::issue_certificate_for_subject(
+        &CertificateType([42; 32]),
+        &subject,
+        IndexMap::from([
+            ("name".into(), "Alice".into()),
+            ("email".into(), "a@example.test".into()),
+            ("other".into(), "private".into()),
+        ]),
+        &issuer,
+        default_get_revocation_outpoint,
+        None,
+    )
+    .await
+    .unwrap();
+    let server_key = PrivateKey::from_random().unwrap();
+    let verifier_key = server_key.to_public_key();
+    let verifier = verifier_key.to_der_hex();
+    let server = MockWallet::new(server_key);
+    let transport = Arc::new(ActixTransport::new());
+    let peer = Arc::new(Peer::new(server.clone(), transport.clone()));
+    let requested = RequestedCertificateSet {
+        certifiers: vec![issuer_id.clone()],
+        types: IndexMap::from([(B64.encode([42; 32]), vec!["name".into(), "email".into()])]),
+    };
+    let config = AuthMiddlewareConfigBuilder::new()
+        .wallet(server)
+        .trusted_certifiers(vec![issuer_id])
+        .certificates_to_request(requested)
+        .build()
+        .unwrap();
+    let layer = AuthLayer::from_config(config, peer, transport)
+        .await
+        .unwrap();
+    let gate = layer.certificate_gate_ref().unwrap().clone();
+    let app = Router::new()
+        .route("/", get(|| async { "ok" }))
+        .layer(layer);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let http = reqwest::Client::new();
+    for (tag, (fields, accepted)) in [
+        (vec!["name"], false),
+        (vec!["other"], false),
+        (vec!["name", "email", "other"], false),
+        (vec![], false),
+        (vec!["name", "email"], true),
+        (vec!["email", "name"], true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let nonce = handshake(&http, &url, &holder).await;
+        let fields: Vec<String> = fields.into_iter().map(str::to_string).collect();
+        let keyring = if fields.is_empty() {
+            IndexMap::new()
+        } else {
+            master
+                .create_keyring_for_verifier(
+                    &verifier_key,
+                    &fields,
+                    &master.certificate.certifier,
+                    &wallet,
+                )
+                .await
+                .unwrap()
+        };
+        let cert = VerifiableCertificate::new(master.certificate.clone(), keyring);
+        let mut proof =
+            proof_message(&wallet, &holder, &verifier, &nonce, cert, tag as u8 + 50).await;
+        // The sender cannot redefine the retained request to match its keyring.
+        proof.requested_certificates = Some(RequestedCertificateSet {
+            certifiers: vec![],
+            types: IndexMap::from([(B64.encode([42; 32]), fields.clone())]),
+        });
+        let response = http
+            .post(format!("{url}.well-known/auth"))
+            .json(&proof)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status() == 200,
+            accepted,
+            "disclosed fields {fields:?}"
+        );
+        assert_eq!(
+            gate.validated_for_session(&nonce, &holder).await.is_some(),
+            accepted
+        );
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn sdk_eviction_removes_the_corresponding_certificate_batch() {
+    use bsv::auth::certificates::VerifiableCertificate;
+    let issuer_key = PrivateKey::from_random().unwrap();
+    let issuer_id = issuer_key.to_public_key().to_der_hex();
+    let issuer = MockWallet::new(issuer_key);
+    let key = PrivateKey::from_random().unwrap();
+    let subject = key.to_public_key();
+    let holder = subject.to_der_hex();
+    let wallet = MockWallet::new(key);
+    let mut certs = Vec::new();
+    for _ in 0..2 {
+        let cert = MasterCertificate::issue_certificate_for_subject(
+            &CertificateType([42; 32]),
+            &subject,
+            IndexMap::from([("name".to_string(), "Alice".to_string())]),
+            &issuer,
+            default_get_revocation_outpoint,
+            None,
+        )
+        .await
+        .unwrap();
+        certs.push(VerifiableCertificate::new(
+            cert.certificate.clone(),
+            IndexMap::new(),
+        ));
+    }
+    let server_key = PrivateKey::from_random().unwrap();
+    let verifier = server_key.to_public_key().to_der_hex();
+    let server = MockWallet::new(server_key);
+    let transport = Arc::new(ActixTransport::new());
+    let peer = Arc::new(Peer::new(server.clone(), transport.clone()));
+    // SDK callbacks may be delayed and delivered through a shared queue.
+    // Their completion order carries no session authority.
+    peer.listen_for_certificates_received(Arc::new(|_, _| {
+        Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            Ok(())
+        })
+    }));
+    let requested = RequestedCertificateSet {
+        certifiers: vec![issuer_id.clone()],
+        types: IndexMap::from([(B64.encode([42; 32]), vec![])]),
+    };
+    let config = AuthMiddlewareConfigBuilder::new()
+        .wallet(server)
+        .trusted_certifiers(vec![issuer_id])
+        .certificates_to_request(requested)
+        .build()
+        .unwrap();
+    let layer = AuthLayer::from_config(config, peer.clone(), transport)
+        .await
+        .unwrap();
+    let gate = layer.certificate_gate_ref().unwrap().clone();
+    let app = Router::new()
+        .route("/", get(|| async { "ok" }))
+        .layer(layer);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let http = reqwest::Client::new();
+
+    let old = handshake(&http, &url, &holder).await;
+    let proof = proof_message(&wallet, &holder, &verifier, &old, certs[0].clone(), 90).await;
+    let endpoint = format!("{url}.well-known/auth");
+    assert_eq!(
+        http.post(&endpoint)
+            .json(&proof)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert!(gate.validated_for_session(&old, &holder).await.is_some());
+    // Exercise the pinned SDK's real 1024-session cap without test-only SDK APIs.
+    let mut newest = String::new();
+    for _ in 0..1025 {
+        newest = handshake(&http, &url, &holder).await;
+    }
+    assert!(peer.session_peer_identity_for(&old).await.is_none());
+    assert_eq!(peer.sessions_for_identity(&holder).await.len(), 1024);
+    // No further certificate exchange: the periodic lifecycle cleanup must
+    // reclaim the evicted batch even when the server becomes idle now.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while gate.validated_for_session(&old, &holder).await.is_some()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        gate.validated_for_session(&old, &holder).await.is_none(),
+        "evicted session retained its certificate batch"
+    );
+    let proof = proof_message(&wallet, &holder, &verifier, &newest, certs[1].clone(), 91).await;
+    assert_eq!(
+        http.post(&endpoint)
+            .json(&proof)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        gate.validated_for_session(&newest, &holder).await.unwrap()[0].serial_number,
+        certs[1].serial_number
+    );
+    task.abort();
+}

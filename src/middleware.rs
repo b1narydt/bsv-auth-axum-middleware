@@ -216,6 +216,7 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
                 Some(cert_req_rx) => {
                     let gate =
                         crate::certificate::CertificateGate::new().with_policy(policy.clone());
+                    gate.start_session_pruner(Arc::downgrade(&peer));
                     let gate_clone = gate.clone();
                     let callback = config.on_certificates_received.clone();
                     let (cert_tx, cert_rx) = tokio::sync::mpsc::unbounded_channel();

@@ -149,6 +149,7 @@ pub struct CertificateGate {
     // Identity-only maps above are legacy observation APIs, never HTTP authority.
     sessions: Arc<DashMap<String, Arc<SessionCertificates>>>,
     policy: Option<Arc<CertificateValidationPolicy>>,
+    admission: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct SessionCertificates {
@@ -166,12 +167,63 @@ impl CertificateGate {
             validated: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
             policy: None,
+            admission: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
     pub(crate) fn with_policy(mut self, policy: Arc<CertificateValidationPolicy>) -> Self {
         self.policy = Some(policy);
         self
+    }
+
+    // Snapshot keys before awaiting SDK liveness; never hold a DashMap guard
+    // across an await. Pointer-checked removal cannot delete a new record that
+    // was installed after this sweep's snapshot.
+    async fn prune_sessions_using<F, Fut>(&self, mut active_identity: F)
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Option<String>>,
+    {
+        let entries: Vec<_> = self
+            .sessions
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        for (nonce, record) in entries {
+            if active_identity(nonce.clone()).await.as_deref() != Some(record.identity_key.as_str())
+            {
+                self.sessions
+                    .remove_if(&nonce, |_, current| Arc::ptr_eq(current, &record));
+            }
+        }
+    }
+
+    async fn prune_sessions<W>(&self, peer: &bsv::auth::peer::Peer<W>)
+    where
+        W: bsv::wallet::interfaces::WalletInterface + Clone + 'static,
+    {
+        self.prune_sessions_using(
+            |nonce| async move { peer.session_peer_identity_for(&nonce).await },
+        )
+        .await;
+    }
+
+    pub(crate) fn start_session_pruner<W>(&self, peer: std::sync::Weak<bsv::auth::peer::Peer<W>>)
+    where
+        W: bsv::wallet::interfaces::WalletInterface + Clone + 'static,
+    {
+        let gate = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let Some(peer) = peer.upgrade() else {
+                    break;
+                };
+                // The SDK accessor honors both its cap eviction and idle TTL,
+                // even when the SDK has not physically reaped expired entries.
+                gate.prune_sessions(&peer).await;
+            }
+        });
     }
 
     /// Read only the batch validated for this exact local BRC session and peer.
@@ -229,6 +281,26 @@ impl CertificateGate {
             .clone()
             .filter(|c| !c.is_empty())
             .ok_or_else(reject)?;
+        // The SDK decrypts the supplied keys on the nonempty path, but does
+        // not enforce that they equal the retained field request. A valid key
+        // for a different field is not evidence for the field we requested.
+        let requested = session.requested_certificates.as_ref().ok_or_else(reject)?;
+        for cert in &certs {
+            let fields = requested
+                .types
+                .get(&BASE64.encode(cert.cert_type.0))
+                .ok_or_else(reject)?;
+            let expected: std::collections::BTreeSet<_> = fields.iter().collect();
+            let disclosed: std::collections::BTreeSet<_> = cert.keyring.keys().collect();
+            if expected != disclosed {
+                return Err(reject());
+            }
+        }
+        // Bound persistent records to the SDK's active session set during
+        // admission as well as while idle. Serialize prune+insert so a burst of
+        // concurrent handshakes cannot accumulate a lifetime-sized stale map.
+        let admission = self.admission.lock().await;
+        self.prune_sessions(peer).await;
         let record = self
             .sessions
             .entry(nonce.to_string())
@@ -239,6 +311,7 @@ impl CertificateGate {
                 })
             })
             .clone();
+        drop(admission);
         let mut batch = record.batch.lock().await;
         if record.identity_key != identity || batch.is_some() {
             return Err(reject());
@@ -479,6 +552,90 @@ mod tests {
     fn test_release_unknown_key_does_not_panic() {
         let gate = CertificateGate::new();
         gate.release("unknown_key");
+    }
+
+    #[tokio::test]
+    async fn session_pruning_tracks_sdk_cap_idle_expiry_and_current_batches() {
+        use bsv::auth::session_manager::SessionManager;
+        use bsv::auth::types::PeerSession;
+        // Use the actual SDK lifecycle implementation with explicit test time,
+        // not a wall-clock sleep or an expanded SDK API. The wire test separately
+        // drives Peer through its real 1024-session cap.
+        const CAP: usize = 1024;
+        let mut manager = SessionManager::with_config(100, 100);
+        let gate = CertificateGate::new();
+        let issuer = ProtoWallet::new(PrivateKey::from_random().unwrap());
+        let subject = PrivateKey::from_random().unwrap().to_public_key();
+        let identity = subject.to_der_hex();
+        let certs = [
+            issue(&issuer, &subject, [4; 32]).await,
+            issue(&issuer, &subject, [4; 32]).await,
+        ];
+        for index in 0..CAP + 2 {
+            let nonce = index.to_string();
+            manager.add_session_capped(
+                PeerSession {
+                    session_nonce: nonce.clone(),
+                    peer_identity_key: identity.clone(),
+                    peer_nonce: format!("peer-{index}"),
+                    is_authenticated: true,
+                    requested_certificates: None,
+                    certificates_required: true,
+                    certificates_validated: true,
+                },
+                0,
+                CAP,
+            );
+            gate.sessions.insert(
+                nonce,
+                Arc::new(SessionCertificates {
+                    identity_key: identity.clone(),
+                    batch: tokio::sync::Mutex::new(Some(vec![certs[index % 2].clone()])),
+                }),
+            );
+        }
+        gate.prune_sessions_using(|nonce| {
+            std::future::ready(
+                manager
+                    .get_active_session(&nonce, 0)
+                    .map(|s| s.peer_identity_key.clone()),
+            )
+        })
+        .await;
+        assert_eq!(gate.sessions.len(), CAP);
+        assert!(gate.validated_for_session("0", &identity).await.is_none());
+        assert!(gate.validated_for_session("1", &identity).await.is_none());
+        for index in CAP..CAP + 2 {
+            manager.touch(&index.to_string(), 50);
+        }
+        // All but the two touched concurrent sessions expire at t=101.
+        gate.prune_sessions_using(|nonce| {
+            std::future::ready(
+                manager
+                    .get_active_session(&nonce, 101)
+                    .map(|s| s.peer_identity_key.clone()),
+            )
+        })
+        .await;
+        assert_eq!(gate.sessions.len(), 2);
+        for index in CAP..CAP + 2 {
+            assert_eq!(
+                gate.validated_for_session(&index.to_string(), &identity)
+                    .await
+                    .unwrap()[0]
+                    .serial_number,
+                certs[index % 2].serial_number
+            );
+        }
+        gate.prune_sessions_using(|nonce| {
+            std::future::ready(
+                manager
+                    .get_active_session(&nonce, 151)
+                    .map(|s| s.peer_identity_key.clone()),
+            )
+        })
+        .await;
+        assert!(gate.sessions.is_empty());
     }
 
     // -- validation helpers ----------------------------------------------
