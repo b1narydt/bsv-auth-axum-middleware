@@ -20,7 +20,7 @@ use bsv::auth::certificates::VerifiableCertificate;
 pub struct Authenticated {
     /// Compressed hex public key of the authenticated caller.
     pub identity_key: String,
-    /// Validated certificates presented by the caller.
+    /// Validated certificates presented by this exact authenticated BRC session.
     ///
     /// Populated only when the middleware is certificate-gated (non-empty
     /// `trusted_certifiers`): every certificate here has passed subject-bind,
@@ -49,4 +49,13 @@ impl<S: Send + Sync> FromRequestParts<S> for Authenticated {
                     .into_response()
             })
     }
+}
+
+/// Exact local BRC session selected by a successfully verified HTTP request.
+/// Separate from `Authenticated` to preserve existing struct construction.
+/// Present only on authenticated requests; never on anonymous passthrough.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedSession {
+    /// Server-generated nonce identifying this session generation.
+    pub session_nonce: String,
 }

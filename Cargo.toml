@@ -1,6 +1,6 @@
 [package]
 name = "bsv-auth-axum-middleware"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 rust-version = "1.88"
 description = "BSV BRC-104 (BRC-103 over HTTP) mutual authentication middleware for axum (port of bsv-auth-actix-middleware)"
@@ -24,9 +24,9 @@ name = "bsv_auth_axum_middleware"
 [workspace]
 
 [dependencies]
-# BSV SDK 0.8 uses a background receive task and preserves certificate keyrings
-# in VerifiableCertificate. Repoint this path to the published release separately.
-bsv-sdk = { version = "0.8.0", features = ["network"] }
+# The maintained 0.8.1 source below supplies retained-request zero-field
+# validation. Downstream workspaces must carry the same graph-wide patch.
+bsv-sdk = { version = "0.8.1", features = ["network"] }
 
 # Axum + tower
 axum = { version = "0.8", features = ["json"] }
@@ -60,3 +60,6 @@ indexmap = "2"
 [dev-dependencies]
 tokio = { version = "1.51", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
+
+[patch.crates-io]
+bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", rev = "13b2d4b40fa32e13ff13b553239d94d4375804df" }

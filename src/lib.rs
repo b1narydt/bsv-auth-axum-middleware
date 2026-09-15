@@ -17,7 +17,7 @@ pub use certificate::{
 };
 pub use config::{AuthMiddlewareConfig, AuthMiddlewareConfigBuilder, OnCertificatesReceived};
 pub use error::AuthMiddlewareError;
-pub use extractor::Authenticated;
+pub use extractor::{Authenticated, AuthenticatedSession};
 pub use helpers::{extract_auth_headers, AuthHeaders};
 pub use middleware::{AuthLayer, AuthService};
 pub use transport::{ActixTransport, DEFAULT_PENDING_TIMEOUT};

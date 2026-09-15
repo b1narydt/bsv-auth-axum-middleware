@@ -131,7 +131,8 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
         }
     }
 
-    /// Set a certificate gate for per-identity request gating.
+    /// Set a certificate gate. Identity-only `mark_validated` does not grant
+    /// HTTP authority; normal callers obtain a policy-bound gate via `from_config`.
     pub fn with_certificate_gate(mut self, gate: CertificateGate) -> Self {
         self.certificate_gate = Some(gate);
         self
@@ -158,8 +159,9 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
     ///    receiver from the Peer (one-shot take).
     /// 3. Spawns a background `certificate_listener_task` that VALIDATES each
     ///    incoming certificate (subject-bind + certifier-PIN + type-PIN +
-    ///    certifier-signature) and releases the per-identity gate only on
-    ///    success.
+    ///    certifier-signature) for legacy identity observations and callbacks.
+    ///    HTTP authority is recorded separately by synchronous session-bound
+    ///    dispatch in the well-known handler; callback order is never authority.
     ///
     /// # Errors
     /// Returns `AuthMiddlewareError::Config` when `allow_unauthenticated` is
@@ -212,7 +214,8 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
 
             match cert_req_rx {
                 Some(cert_req_rx) => {
-                    let gate = crate::certificate::CertificateGate::new();
+                    let gate =
+                        crate::certificate::CertificateGate::new().with_policy(policy.clone());
                     let gate_clone = gate.clone();
                     let callback = config.on_certificates_received.clone();
                     let (cert_tx, cert_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -315,7 +318,7 @@ where
             // Branch 1: Handshake at /.well-known/auth
             if path == "/.well-known/auth" {
                 debug!("BRC-31 handshake request at /.well-known/auth");
-                return Ok(handle_handshake(req, transport).await);
+                return Ok(handle_handshake(req, transport, peer, certificate_gate).await);
             }
 
             // Check for auth headers
@@ -367,55 +370,57 @@ where
 
                     let mut parts = parts;
 
-                    // 4. Certificate gating — authorise on VALIDATED-CERTIFICATE
-                    // PRESENCE, never on session existence (F1 fix).
-                    //
-                    // When a cert gate is engaged, the request is released only
-                    // once the background listener has recorded validated
-                    // certificates for this identity (subject-bind + certifier-PIN
-                    // + type-PIN + certifier-signature all passed). A caller with a
-                    // live signature-verified session but no valid certificate does
-                    // NOT pass here.
-                    //
-                    // F4 lost-wakeup fix: arm the `Notified` future (via `enable()`)
-                    // BEFORE checking the validated-cert store, so a release that
-                    // lands between the check and the await still wakes us. If the
-                    // certs are already present we skip the wait entirely.
-                    let mut validated_certs: Vec<VerifiableCertificate> = Vec::new();
-                    if let Some(ref gate) = certificate_gate {
-                        let notify = gate.register(&headers.identity_key);
-                        let notified = notify.notified();
-                        tokio::pin!(notified);
-                        notified.as_mut().enable();
-
-                        match gate.validated_for(&headers.identity_key) {
-                            Some(certs) => {
-                                validated_certs = certs;
-                            }
-                            None => {
-                                if tokio::time::timeout(Duration::from_secs(30), notified)
-                                    .await
-                                    .is_err()
-                                {
-                                    warn!(identity_key = %headers.identity_key, "certificate validation timed out");
-                                    return Ok(
-                                        AuthMiddlewareError::CertificateTimeout.into_response()
-                                    );
-                                }
-                                match gate.validated_for(&headers.identity_key) {
-                                    Some(certs) => validated_certs = certs,
-                                    None => {
-                                        // Woken without validated certs => no valid
-                                        // certificate was presented. Reject.
-                                        warn!(identity_key = %headers.identity_key, "no valid certificate presented -- rejecting cert-gated request");
-                                        return Ok(
-                                            AuthMiddlewareError::CertificateTimeout.into_response()
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                    // 4. The SDK has verified this request for headers.your_nonce.
+                    // Select the exact local session again, never its identity's
+                    // "best" session or a callback's last-seen certificate batch.
+                    let local_session = peer.session_by_identifier(&headers.your_nonce).await;
+                    let Some(local_session) = local_session.filter(|session| {
+                        session.session_nonce == headers.your_nonce
+                            && session.is_authenticated
+                            && session
+                                .peer_identity_key
+                                .eq_ignore_ascii_case(&headers.identity_key)
+                    }) else {
+                        return Ok(AuthMiddlewareError::Unauthorized.into_response());
+                    };
+                    if peer
+                        .session_peer_identity_for(&headers.your_nonce)
+                        .await
+                        .as_deref()
+                        != Some(local_session.peer_identity_key.as_str())
+                    {
+                        return Ok(AuthMiddlewareError::Unauthorized.into_response());
                     }
+                    let validated_certs: Vec<VerifiableCertificate> = match certificate_gate {
+                        Some(ref gate) => match gate
+                            .validated_for_session(
+                                &local_session.session_nonce,
+                                &local_session.peer_identity_key,
+                            )
+                            .await
+                        {
+                            Some(certs) => certs,
+                            None => {
+                                return Ok(AuthMiddlewareError::CertificateTimeout.into_response())
+                            }
+                        },
+                        None => Vec::new(),
+                    };
+                    // The proof mutex may have waited for a concurrent SDK
+                    // validation/callback; a session evicted meanwhile refuses.
+                    if peer
+                        .session_peer_identity_for(&headers.your_nonce)
+                        .await
+                        .as_deref()
+                        != Some(local_session.peer_identity_key.as_str())
+                    {
+                        return Ok(AuthMiddlewareError::Unauthorized.into_response());
+                    }
+                    parts
+                        .extensions
+                        .insert(crate::extractor::AuthenticatedSession {
+                            session_nonce: local_session.session_nonce,
+                        });
 
                     // 4b. Surface identity + validated certs to the handler.
                     parts.extensions.insert(Authenticated {
@@ -455,7 +460,12 @@ where
 // Handshake handler
 // ---------------------------------------------------------------------------
 
-async fn handle_handshake(req: Request<Body>, transport: Arc<ActixTransport>) -> Response<Body> {
+async fn handle_handshake<W: WalletInterface + Clone + 'static>(
+    req: Request<Body>,
+    transport: Arc<ActixTransport>,
+    peer: Arc<Peer<W>>,
+    certificate_gate: Option<CertificateGate>,
+) -> Response<Body> {
     // Read body
     let body_bytes = match req.into_body().collect().await {
         Ok(c) => c.to_bytes(),
@@ -519,6 +529,20 @@ async fn handle_handshake(req: Request<Body>, transport: Arc<ActixTransport>) ->
                     axum::Json(serde_json::json!({"status": "No certificates provided"})),
                 )
                     .into_response();
+            }
+
+            // Await SDK validation for this exact response before recording
+            // session authority. The legacy listener has no session identifier
+            // and remains an observation/callback API only.
+            if matches!(auth_msg.message_type, MessageType::CertificateResponse) {
+                let result = match certificate_gate {
+                    Some(ref gate) => gate.validate_session_response(&peer, auth_msg).await,
+                    None => peer.dispatch_message(auth_msg).await,
+                };
+                return match result {
+                    Ok(()) => axum::Json(serde_json::json!({"status":"ok"})).into_response(),
+                    Err(error) => AuthMiddlewareError::BsvSdk(error).into_response(),
+                };
             }
 
             // Determine the correlation key: TS stores handles under the

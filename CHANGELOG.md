@@ -1,3 +1,14 @@
+## 0.4.1 — session-bound HTTP certificate batches (#529)
+
+- Bind HTTP certificate authority to the exact authenticated local BRC session,
+  not the wallet identity shared by concurrent sessions.
+- Await SDK proof validation and retained-request checks before recording the
+  first immutable session batch; replacement credentials require reconnect.
+- Preserve `Authenticated` and legacy identity observation APIs; expose separate
+  `AuthenticatedSession` and read-only session batch lookup.
+- Consume the maintained 0.8.1 SDK source and cover both certificate orders,
+  concurrent/reused HTTP, zero/nonempty disclosure and hostile frames.
+
 # Changelog
 
 All notable changes to this project will be documented in this file.

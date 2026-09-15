@@ -165,8 +165,29 @@ let config = AuthMiddlewareConfigBuilder::new()
     .expect("valid config");
 ```
 
-The middleware will gate authenticated requests until the required certificates
-are received, using `CertificateGate` to coordinate the asynchronous exchange.
+Configure a nonempty `trusted_certifiers` set to engage certificate gating.
+The well-known handler awaits SDK proof validation against the exact local
+session and its retained request, validates issuer/type/subject/signature policy,
+and stores the first accepted batch immutably for that session. A new credential
+requires a new handshake. General HTTP requests read only that exact session's
+batch, so simultaneous sessions with the same wallet key cannot borrow each
+other's certificates. Nonempty-field proofs remain supported.
+
+`Authenticated` retains its two-field public shape; `certificates` now means the
+batch proved by this exact request's authenticated BRC session. A separate
+`AuthenticatedSession` extension exposes the server-generated `session_nonce`.
+`CertificateGate::validated_for_session(nonce, identity).await` reads a snapshot;
+callers must separately establish session liveness and their application policy.
+The old identity-only gate methods and `on_certificates_received` callback remain
+available for observation, but never authorize HTTP requests. In particular,
+calling `mark_validated(identity, certs)` cannot release a session's HTTP gate.
+
+This source uses maintained `bsv-sdk` 0.8.1 at revision
+`13b2d4b40fa32e13ff13b553239d94d4375804df` via `[patch.crates-io]`.
+Cargo ignores dependency-local patches: consuming workspaces must apply that
+same graph-wide patch. No registry publication is implied. Certificate currentness,
+revocation, grant policy and application authorization remain the consumer's
+responsibility.
 
 ## License
 

@@ -1,7 +1,7 @@
 //! Certificate gate, validation, and background listener for certificate exchange.
 //!
-//! Provides `CertificateGate` for per-identity-key request gating (keyed on
-//! *validated-certificate presence*, never on mere session existence),
+//! Provides `CertificateGate` for session-bound HTTP authorization (keyed on
+//! *validated-certificate presence*, never on identity or mere session existence),
 //! `validate_certificate` for BRC-103/104 certificate validation, and
 //! `certificate_listener_task` for consuming certificate channels from the
 //! BSV SDK Peer and releasing the gate only after validation succeeds.
@@ -136,20 +136,26 @@ pub async fn validate_certificate(
 // CertificateGate
 // ---------------------------------------------------------------------------
 
-/// Per-identity-key gate for blocking requests until *validated* certificates
-/// arrive.
+/// Session-bound certificate authority plus legacy identity observation APIs.
 ///
-/// Two maps back the gate:
-/// - `pending`: identity key → `Notify` waiters registered by in-flight requests.
-/// - `validated`: identity key → the validated certificates recorded by the
-///   background listener.
-///
-/// A request is authorised only when `validated_for` returns certificates for
-/// its identity — session existence alone never releases the gate (F1 fix).
+/// HTTP authorization reads only `sessions`, populated by synchronous proof
+/// dispatch against the exact active local BRC session. Its first validated
+/// batch is immutable. `pending`/`validated` retain the public identity APIs
+/// for compatibility; those maps and listener callbacks cannot authorize HTTP.
 #[derive(Clone)]
 pub struct CertificateGate {
     pending: Arc<DashMap<String, Arc<Notify>>>,
     validated: Arc<DashMap<String, Vec<VerifiableCertificate>>>,
+    // Identity-only maps above are legacy observation APIs, never HTTP authority.
+    sessions: Arc<DashMap<String, Arc<SessionCertificates>>>,
+    policy: Option<Arc<CertificateValidationPolicy>>,
+}
+
+struct SessionCertificates {
+    identity_key: String,
+    // Serialize proof processing for a single local session. The first accepted
+    // batch is immutable; replacement credentials require a fresh handshake.
+    batch: tokio::sync::Mutex<Option<Vec<VerifiableCertificate>>>,
 }
 
 impl CertificateGate {
@@ -158,7 +164,105 @@ impl CertificateGate {
         Self {
             pending: Arc::new(DashMap::new()),
             validated: Arc::new(DashMap::new()),
+            sessions: Arc::new(DashMap::new()),
+            policy: None,
         }
+    }
+
+    pub(crate) fn with_policy(mut self, policy: Arc<CertificateValidationPolicy>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Read only the batch validated for this exact local BRC session and peer.
+    /// Identity-only listener updates cannot populate or replace this record.
+    /// This is a snapshot lookup; the HTTP middleware separately verifies the
+    /// request signature and checks SDK session liveness before and after it.
+    pub async fn validated_for_session(
+        &self,
+        session_nonce: &str,
+        identity_key: &str,
+    ) -> Option<Vec<VerifiableCertificate>> {
+        let session = self.sessions.get(session_nonce)?.clone();
+        if !session.identity_key.eq_ignore_ascii_case(identity_key) {
+            return None;
+        }
+        let batch = session.batch.lock().await.clone();
+        batch
+    }
+
+    /// Process a proof against the exact authenticated, locally nonce-selected
+    /// session. A frame's identity/nonce is a selector, never evidence: the SDK
+    /// verifies the nonce, signature, replay and retained certificate request.
+    /// Completion and policy checks happen here, not in an identity callback.
+    pub(crate) async fn validate_session_response<W>(
+        &self,
+        peer: &bsv::auth::peer::Peer<W>,
+        message: bsv::auth::types::AuthMessage,
+    ) -> Result<(), bsv::auth::error::AuthError>
+    where
+        W: bsv::wallet::interfaces::WalletInterface + Clone + 'static,
+    {
+        use bsv::auth::error::AuthError;
+        let reject = || {
+            AuthError::CertificateValidation(
+                "certificate response is not bound to a pending authenticated session".to_string(),
+            )
+        };
+        let nonce = message.your_nonce.as_deref().ok_or_else(reject)?;
+        let identity = peer
+            .session_peer_identity_for(nonce)
+            .await
+            .ok_or_else(reject)?;
+        let session = peer.session_by_identifier(nonce).await.ok_or_else(reject)?;
+        if session.session_nonce != nonce
+            || !session.is_authenticated
+            || !identity.eq_ignore_ascii_case(&message.identity_key)
+            || !session.certificates_required
+            || session.requested_certificates.is_none()
+        {
+            return Err(reject());
+        }
+        let policy = self.policy.as_ref().ok_or_else(reject)?;
+        let certs = message
+            .certificates
+            .clone()
+            .filter(|c| !c.is_empty())
+            .ok_or_else(reject)?;
+        let record = self
+            .sessions
+            .entry(nonce.to_string())
+            .or_insert_with(|| {
+                Arc::new(SessionCertificates {
+                    identity_key: identity.clone(),
+                    batch: tokio::sync::Mutex::new(None),
+                })
+            })
+            .clone();
+        let mut batch = record.batch.lock().await;
+        if record.identity_key != identity || batch.is_some() {
+            return Err(reject());
+        }
+        // Direct dispatch awaits cryptographic validation. Never infer success
+        // from callback timing, sender fields, or certificates_validated alone.
+        peer.dispatch_message(message.clone()).await?;
+        let verifier = ProtoWallet::anyone();
+        for cert in &certs {
+            validate_certificate(cert, &identity, policy, &verifier)
+                .await
+                .map_err(|_| reject())?;
+        }
+        let after = peer.session_by_identifier(nonce).await.ok_or_else(reject)?;
+        if peer.session_peer_identity_for(nonce).await.as_deref() != Some(identity.as_str())
+            || after.session_nonce != nonce
+            || after.peer_nonce != session.peer_nonce
+            || !after.is_authenticated
+            || !after.certificates_validated
+        {
+            return Err(reject());
+        }
+        *batch = Some(certs);
+        Ok(())
     }
 
     /// Register a waiter for an identity key, returning the `Notify` to await on.
@@ -173,8 +277,8 @@ impl CertificateGate {
 
     /// Record validated certificates for an identity and wake all waiters.
     ///
-    /// This is the ONLY path that authorises a cert-gated identity. Call it only
-    /// after every certificate for `identity_key` has passed
+    /// Legacy observation API only: this does not authorize HTTP or populate a
+    /// session batch. Call it only after every certificate has passed
     /// [`validate_certificate`].
     pub fn mark_validated(&self, identity_key: &str, certs: Vec<VerifiableCertificate>) {
         self.validated.insert(identity_key.to_string(), certs);
@@ -183,7 +287,7 @@ impl CertificateGate {
         }
     }
 
-    /// The validated certificates recorded for an identity, if any.
+    /// Legacy identity observation, not evidence of any particular session.
     pub fn validated_for(&self, identity_key: &str) -> Option<Vec<VerifiableCertificate>> {
         self.validated.get(identity_key).map(|e| e.value().clone())
     }
