@@ -27,11 +27,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use bsv::auth::certificates::{AuthCertificate, VerifiableCertificate};
-use bsv::auth::types::RequestedCertificateSet;
 use bsv::primitives::public_key::PublicKey;
 use bsv::wallet::interfaces::Certificate;
 use bsv::wallet::proto_wallet::ProtoWallet;
@@ -40,6 +40,13 @@ use tokio::sync::mpsc;
 use tokio::sync::Notify;
 
 use crate::config::OnCertificatesReceived;
+
+/// Maximum number of identities retained by each compatibility-only observer
+/// map. Exact-session HTTP authority is held separately and is not affected.
+pub const OBSERVATION_IDENTITY_CAPACITY: usize = 1024;
+
+/// Maximum idle age for compatibility-only identity observations.
+pub const OBSERVATION_IDENTITY_TTL: Duration = Duration::from_secs(15 * 60);
 
 // ---------------------------------------------------------------------------
 // Validation policy + result
@@ -144,12 +151,32 @@ pub async fn validate_certificate(
 /// for compatibility; those maps and listener callbacks cannot authorize HTTP.
 #[derive(Clone)]
 pub struct CertificateGate {
-    pending: Arc<DashMap<String, Arc<Notify>>>,
-    validated: Arc<DashMap<String, Vec<VerifiableCertificate>>>,
+    pending: Arc<DashMap<String, PendingObservation>>,
+    validated: Arc<DashMap<String, ValidatedObservation>>,
+    observation_limits: ObservationLimits,
+    observation_mutation: Arc<std::sync::Mutex<()>>,
     // Identity-only maps above are legacy observation APIs, never HTTP authority.
     sessions: Arc<DashMap<String, Arc<SessionCertificates>>>,
     policy: Option<Arc<CertificateValidationPolicy>>,
     admission: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Clone)]
+struct PendingObservation {
+    notify: Arc<Notify>,
+    touched_at: Instant,
+}
+
+#[derive(Clone)]
+struct ValidatedObservation {
+    certificates: Vec<VerifiableCertificate>,
+    touched_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct ObservationLimits {
+    capacity: usize,
+    ttl: Duration,
 }
 
 struct SessionCertificates {
@@ -165,9 +192,70 @@ impl CertificateGate {
         Self {
             pending: Arc::new(DashMap::new()),
             validated: Arc::new(DashMap::new()),
+            observation_limits: ObservationLimits {
+                capacity: OBSERVATION_IDENTITY_CAPACITY,
+                ttl: OBSERVATION_IDENTITY_TTL,
+            },
+            observation_mutation: Arc::new(std::sync::Mutex::new(())),
             sessions: Arc::new(DashMap::new()),
             policy: None,
             admission: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_observation_limits(mut self, capacity: usize, ttl: Duration) -> Self {
+        self.observation_limits = ObservationLimits {
+            capacity: capacity.max(1),
+            ttl,
+        };
+        self
+    }
+
+    fn prune_observations_locked(&self, now: Instant) {
+        let ttl = self.observation_limits.ttl;
+        let expired_pending: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|entry| now.saturating_duration_since(entry.touched_at) >= ttl)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in expired_pending {
+            if let Some((_, pending)) = self.pending.remove(&key) {
+                pending.notify.notify_waiters();
+            }
+        }
+        self.validated
+            .retain(|_, entry| now.saturating_duration_since(entry.touched_at) < ttl);
+    }
+
+    fn evict_oldest_pending_locked(&self) {
+        if self.pending.len() < self.observation_limits.capacity {
+            return;
+        }
+        let oldest = self
+            .pending
+            .iter()
+            .min_by_key(|entry| entry.touched_at)
+            .map(|entry| entry.key().clone());
+        if let Some(key) = oldest {
+            if let Some((_, pending)) = self.pending.remove(&key) {
+                pending.notify.notify_waiters();
+            }
+        }
+    }
+
+    fn evict_oldest_validated_locked(&self) {
+        if self.validated.len() < self.observation_limits.capacity {
+            return;
+        }
+        let oldest = self
+            .validated
+            .iter()
+            .min_by_key(|entry| entry.touched_at)
+            .map(|entry| entry.key().clone());
+        if let Some(key) = oldest {
+            self.validated.remove(&key);
         }
     }
 
@@ -342,10 +430,26 @@ impl CertificateGate {
     ///
     /// Multiple waiters on the same identity key share the same `Notify`.
     pub fn register(&self, identity_key: &str) -> Arc<Notify> {
-        self.pending
-            .entry(identity_key.to_string())
-            .or_insert_with(|| Arc::new(Notify::new()))
-            .clone()
+        let _mutation = self
+            .observation_mutation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        self.prune_observations_locked(now);
+        if let Some(mut existing) = self.pending.get_mut(identity_key) {
+            existing.touched_at = now;
+            return existing.notify.clone();
+        }
+        self.evict_oldest_pending_locked();
+        let notify = Arc::new(Notify::new());
+        self.pending.insert(
+            identity_key.to_string(),
+            PendingObservation {
+                notify: notify.clone(),
+                touched_at: now,
+            },
+        );
+        notify
     }
 
     /// Record validated certificates for an identity and wake all waiters.
@@ -354,15 +458,38 @@ impl CertificateGate {
     /// session batch. Call it only after every certificate has passed
     /// [`validate_certificate`].
     pub fn mark_validated(&self, identity_key: &str, certs: Vec<VerifiableCertificate>) {
-        self.validated.insert(identity_key.to_string(), certs);
-        if let Some((_, notify)) = self.pending.remove(identity_key) {
-            notify.notify_waiters();
+        let _mutation = self
+            .observation_mutation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        self.prune_observations_locked(now);
+        if !self.validated.contains_key(identity_key) {
+            self.evict_oldest_validated_locked();
+        }
+        self.validated.insert(
+            identity_key.to_string(),
+            ValidatedObservation {
+                certificates: certs,
+                touched_at: now,
+            },
+        );
+        if let Some((_, pending)) = self.pending.remove(identity_key) {
+            pending.notify.notify_waiters();
         }
     }
 
     /// Legacy identity observation, not evidence of any particular session.
     pub fn validated_for(&self, identity_key: &str) -> Option<Vec<VerifiableCertificate>> {
-        self.validated.get(identity_key).map(|e| e.value().clone())
+        let _mutation = self
+            .observation_mutation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        self.prune_observations_locked(now);
+        let mut entry = self.validated.get_mut(identity_key)?;
+        entry.touched_at = now;
+        Some(entry.certificates.clone())
     }
 
     /// Wake any waiters for an identity WITHOUT recording certificates.
@@ -371,8 +498,13 @@ impl CertificateGate {
     /// waiter re-checks `validated_for` and rejects when it is still empty.
     /// Retained for callers that need to unblock a waiter explicitly.
     pub fn release(&self, identity_key: &str) {
-        if let Some((_, notify)) = self.pending.remove(identity_key) {
-            notify.notify_waiters();
+        let _mutation = self
+            .observation_mutation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.prune_observations_locked(Instant::now());
+        if let Some((_, pending)) = self.pending.remove(identity_key) {
+            pending.notify.notify_waiters();
         }
     }
 }
@@ -401,10 +533,9 @@ impl Default for CertificateGate {
 /// On any validation failure (or an empty batch) the gate is NOT released — the
 /// waiting request times out and is rejected.
 ///
-/// Exits when both channels are closed.
+/// Exits when the certificate channel is closed.
 pub async fn certificate_listener_task(
     mut cert_rx: mpsc::UnboundedReceiver<(String, Vec<VerifiableCertificate>)>,
-    mut cert_req_rx: mpsc::Receiver<(String, RequestedCertificateSet)>,
     gate: CertificateGate,
     policy: Arc<CertificateValidationPolicy>,
     callback: Option<Arc<OnCertificatesReceived>>,
@@ -414,83 +545,65 @@ pub async fn certificate_listener_task(
     let verifier = ProtoWallet::anyone();
 
     loop {
-        tokio::select! {
-            msg = cert_rx.recv() => {
-                match msg {
-                    Some((sender_key, certs)) => {
-                        tracing::info!(
+        match cert_rx.recv().await {
+            Some((sender_key, certs)) => {
+                tracing::info!(
+                    sender = %sender_key,
+                    count = certs.len(),
+                    "certificates received from peer; validating"
+                );
+
+                if certs.is_empty() {
+                    tracing::warn!(
+                        sender = %sender_key,
+                        "no certificates provided -- gate NOT released"
+                    );
+                    continue;
+                }
+
+                // Validate EVERY certificate; reject the whole batch on
+                // the first failure (do not release the gate).
+                let mut all_valid = true;
+                for cert in &certs {
+                    if let Err(reason) =
+                        validate_certificate(cert, &sender_key, &policy, &verifier).await
+                    {
+                        tracing::warn!(
                             sender = %sender_key,
-                            count = certs.len(),
-                            "certificates received from peer; validating"
+                            ?reason,
+                            "certificate REJECTED -- gate NOT released"
                         );
-
-                        if certs.is_empty() {
-                            tracing::warn!(
-                                sender = %sender_key,
-                                "no certificates provided -- gate NOT released"
-                            );
-                            continue;
-                        }
-
-                        // Validate EVERY certificate; reject the whole batch on
-                        // the first failure (do not release the gate).
-                        let mut all_valid = true;
-                        for cert in &certs {
-                            if let Err(reason) =
-                                validate_certificate(cert, &sender_key, &policy, &verifier).await
-                            {
-                                tracing::warn!(
-                                    sender = %sender_key,
-                                    ?reason,
-                                    "certificate REJECTED -- gate NOT released"
-                                );
-                                all_valid = false;
-                                break;
-                            }
-                        }
-                        if !all_valid {
-                            continue;
-                        }
-
-                        tracing::info!(
-                            sender = %sender_key,
-                            count = certs.len(),
-                            "all certificates validated -- releasing gate"
-                        );
-
-                        // 1. Invoke callback fire-and-forget with validated certs.
-                        if let Some(ref cb) = callback {
-                            let cb = Arc::clone(cb);
-                            let key = sender_key.clone();
-                            let certs_for_cb = certs.clone();
-                            tokio::spawn(async move {
-                                let fut = cb(key, certs_for_cb);
-                                fut.await;
-                            });
-                        }
-
-                        // 2. Record validated certs + release the gate.
-                        gate.mark_validated(&sender_key, certs);
-                    }
-                    None => {
-                        tracing::debug!("certificate receiver closed");
+                        all_valid = false;
                         break;
                     }
                 }
+                if !all_valid {
+                    continue;
+                }
+
+                tracing::info!(
+                    sender = %sender_key,
+                    count = certs.len(),
+                    "all certificates validated -- releasing gate"
+                );
+
+                // 1. Invoke callback fire-and-forget with validated certs.
+                if let Some(ref cb) = callback {
+                    let cb = Arc::clone(cb);
+                    let key = sender_key.clone();
+                    let certs_for_cb = certs.clone();
+                    tokio::spawn(async move {
+                        let fut = cb(key, certs_for_cb);
+                        fut.await;
+                    });
+                }
+
+                // 2. Record validated certs + release the gate.
+                gate.mark_validated(&sender_key, certs);
             }
-            msg = cert_req_rx.recv() => {
-                match msg {
-                    Some((sender_key, _requested)) => {
-                        tracing::debug!(
-                            sender = %sender_key,
-                            "certificate request received from peer (handled by Peer internally)"
-                        );
-                    }
-                    None => {
-                        tracing::debug!("certificate request receiver closed");
-                        break;
-                    }
-                }
+            None => {
+                tracing::debug!("certificate receiver closed");
+                break;
             }
         }
     }
@@ -552,6 +665,33 @@ mod tests {
     fn test_release_unknown_key_does_not_panic() {
         let gate = CertificateGate::new();
         gate.release("unknown_key");
+    }
+
+    #[test]
+    fn compatibility_identity_maps_are_capacity_bounded() {
+        let gate = CertificateGate::new().with_observation_limits(2, Duration::from_secs(60));
+
+        gate.register("pending-1");
+        gate.register("pending-2");
+        gate.register("pending-3");
+        assert_eq!(gate.pending.len(), 2);
+
+        gate.mark_validated("validated-1", Vec::new());
+        gate.mark_validated("validated-2", Vec::new());
+        gate.mark_validated("validated-3", Vec::new());
+        assert_eq!(gate.validated.len(), 2);
+    }
+
+    #[test]
+    fn compatibility_identity_maps_expire_by_ttl() {
+        let gate = CertificateGate::new().with_observation_limits(4, Duration::from_millis(1));
+        gate.register("pending");
+        gate.mark_validated("validated", Vec::new());
+        std::thread::sleep(Duration::from_millis(5));
+
+        gate.register("trigger-prune");
+        assert!(!gate.pending.contains_key("pending"));
+        assert!(gate.validated_for("validated").is_none());
     }
 
     #[tokio::test]
@@ -754,22 +894,14 @@ mod tests {
         let gate = CertificateGate::new();
         let _n = gate.register(&sender);
         let (cert_tx, cert_rx) = mpsc::unbounded_channel();
-        let (_req_tx, req_rx) = mpsc::channel::<(String, RequestedCertificateSet)>(8);
 
-        let task = tokio::spawn(certificate_listener_task(
-            cert_rx,
-            req_rx,
-            gate.clone(),
-            pol,
-            None,
-        ));
+        let task = tokio::spawn(certificate_listener_task(cert_rx, gate.clone(), pol, None));
 
         cert_tx.send((sender.clone(), vec![cert])).unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(gate.validated_for(&sender).is_some());
 
         drop(cert_tx);
-        drop(_req_tx);
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }
 
@@ -782,15 +914,8 @@ mod tests {
         let gate = CertificateGate::new();
         let _n = gate.register("sender_1");
         let (cert_tx, cert_rx) = mpsc::unbounded_channel();
-        let (_req_tx, req_rx) = mpsc::channel::<(String, RequestedCertificateSet)>(8);
 
-        let task = tokio::spawn(certificate_listener_task(
-            cert_rx,
-            req_rx,
-            gate.clone(),
-            pol,
-            None,
-        ));
+        let task = tokio::spawn(certificate_listener_task(cert_rx, gate.clone(), pol, None));
 
         cert_tx.send(("sender_1".to_string(), vec![])).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -800,7 +925,6 @@ mod tests {
         );
 
         drop(cert_tx);
-        drop(_req_tx);
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }
 
@@ -827,11 +951,9 @@ mod tests {
         let gate = CertificateGate::new();
         let _n = gate.register(&sender);
         let (cert_tx, cert_rx) = mpsc::unbounded_channel();
-        let (_req_tx, req_rx) = mpsc::channel::<(String, RequestedCertificateSet)>(8);
 
         let task = tokio::spawn(certificate_listener_task(
             cert_rx,
-            req_rx,
             gate.clone(),
             pol,
             Some(Arc::new(callback)),
@@ -845,27 +967,18 @@ mod tests {
         );
 
         drop(cert_tx);
-        drop(_req_tx);
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }
 
     #[tokio::test]
-    async fn test_listener_exits_when_channels_close() {
+    async fn test_listener_exits_when_certificate_channel_closes() {
         let gate = CertificateGate::new();
         let (cert_tx, cert_rx) = mpsc::unbounded_channel::<(String, Vec<VerifiableCertificate>)>();
-        let (cert_req_tx, cert_req_rx) = mpsc::channel::<(String, RequestedCertificateSet)>(8);
         let pol = Arc::new(CertificateValidationPolicy::default());
 
-        let task = tokio::spawn(certificate_listener_task(
-            cert_rx,
-            cert_req_rx,
-            gate,
-            pol,
-            None,
-        ));
+        let task = tokio::spawn(certificate_listener_task(cert_rx, gate, pol, None));
 
         drop(cert_tx);
-        drop(cert_req_tx);
 
         let result = tokio::time::timeout(Duration::from_secs(2), task).await;
         assert!(result.is_ok(), "task should have completed");

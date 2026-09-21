@@ -10,6 +10,8 @@
 //!   "message":"Mutual-authentication failed!"}`
 //! - 408 certificate request timeout: `{"status":"error","code":"CERTIFICATE_TIMEOUT",
 //!   "message":"Certificate request timed out"}`
+//! - 403 certificate rejection: `{"status":"error","code":"ERR_CERTIFICATE_REJECTED",
+//!   "description":"<reason>"}`
 //! - 500 response signing failure: `{"status":"error","code":"ERR_RESPONSE_SIGNING_FAILED",
 //!   "description":"<reason>"}` (TS uses `description` for this variant only)
 
@@ -43,6 +45,11 @@ pub enum AuthMiddlewareError {
     #[error("Certificate request timed out")]
     CertificateTimeout,
 
+    /// A configured certificate authorizer refused an otherwise valid proof.
+    /// Emits a signed 403 on the authenticated general-message path.
+    #[error("Certificate rejected: {0}")]
+    CertificateRejected(String),
+
     /// Response signing failed during general-message flow. Emits
     /// `{"code":"ERR_RESPONSE_SIGNING_FAILED","description":"<reason>"}`.
     #[error("{0}")]
@@ -74,6 +81,17 @@ impl axum::response::IntoResponse for AuthMiddlewareError {
                         "status": "error",
                         "code": "CERTIFICATE_TIMEOUT",
                         "message": "Certificate request timed out",
+                    })),
+                )
+                    .into_response();
+            }
+            AuthMiddlewareError::CertificateRejected(reason) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    axum::Json(serde_json::json!({
+                        "status": "error",
+                        "code": "ERR_CERTIFICATE_REJECTED",
+                        "description": reason,
                     })),
                 )
                     .into_response();
@@ -125,6 +143,7 @@ impl axum::response::IntoResponse for AuthMiddlewareError {
             AuthMiddlewareError::Payload(_) => "ERR_PAYLOAD",
             AuthMiddlewareError::Unauthorized
             | AuthMiddlewareError::CertificateTimeout
+            | AuthMiddlewareError::CertificateRejected(_)
             | AuthMiddlewareError::ResponseSigningFailed(_) => {
                 unreachable!("handled in match above")
             }
@@ -208,6 +227,21 @@ mod tests {
         assert_eq!(json["code"], "CERTIFICATE_TIMEOUT");
         assert_eq!(json["message"], "Certificate request timed out");
         assert!(json.get("description").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_certificate_rejected_error_response_is_forbidden() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let resp = AuthMiddlewareError::CertificateRejected("revoked".to_string()).into_response();
+        assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["code"], "ERR_CERTIFICATE_REJECTED");
+        assert_eq!(json["description"], "revoked");
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@ use bsv::primitives::private_key::PrivateKey;
 use bsv::wallet::interfaces::CertificateType;
 use bsv_auth_axum_middleware::{
     ActixTransport, AuthLayer, AuthMiddlewareConfigBuilder, Authenticated,
+    CertificateAuthorizationDecision, CertificateAuthorizer, CertificateGate,
 };
 use indexmap::IndexMap;
 use mock_wallet::MockWallet;
@@ -68,6 +69,11 @@ async fn same_wallet_distinct_sessions_keep_their_own_certificates() {
             let config = AuthMiddlewareConfigBuilder::new()
                 .wallet(server)
                 .trusted_certifiers(vec![issuer_id])
+                .certificate_authorizer(Box::new(|_, _| {
+                    Box::pin(async {
+                        bsv_auth_axum_middleware::CertificateAuthorizationDecision::Accept
+                    })
+                }))
                 .certificates_to_request(requested)
                 .build()
                 .unwrap();
@@ -172,6 +178,278 @@ async fn proof_message(
     }
 }
 
+async fn general_headers(
+    wallet: &MockWallet,
+    identity: &str,
+    verifier: &str,
+    session: &str,
+    tag: u8,
+    valid_signature: bool,
+) -> reqwest::header::HeaderMap {
+    use bsv::primitives::public_key::PublicKey;
+    use bsv::wallet::interfaces::{CreateSignatureArgs, WalletInterface};
+    use bsv::wallet::types::{Counterparty, CounterpartyType, Protocol};
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    let message_nonce = B64.encode([tag; 32]);
+    let request_id = B64.encode([tag.wrapping_add(1); 32]);
+    let payload = bsv_auth_axum_middleware::payload::serialize_request_payload(
+        &B64.decode(&request_id).unwrap(),
+        "GET",
+        "/",
+        "",
+        &[],
+        None,
+    );
+    let signature = wallet
+        .create_signature(
+            CreateSignatureArgs {
+                data: Some(payload),
+                hash_to_directly_sign: None,
+                protocol_id: Protocol {
+                    security_level: 2,
+                    protocol: bsv::auth::types::AUTH_PROTOCOL_ID.to_string(),
+                },
+                key_id: format!("{message_nonce} {session}"),
+                counterparty: Counterparty {
+                    counterparty_type: CounterpartyType::Other,
+                    public_key: Some(PublicKey::from_string(verifier).unwrap()),
+                },
+                privileged: false,
+                privileged_reason: None,
+                seek_permission: None,
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .signature;
+    let header_request_id = if valid_signature {
+        request_id
+    } else {
+        B64.encode([tag.wrapping_add(2); 32])
+    };
+
+    let mut headers = HeaderMap::new();
+    for (name, value) in [
+        ("x-bsv-auth-version", "0.1".to_string()),
+        ("x-bsv-auth-identity-key", identity.to_string()),
+        ("x-bsv-auth-nonce", message_nonce),
+        ("x-bsv-auth-your-nonce", session.to_string()),
+        ("x-bsv-auth-signature", hex::encode(signature)),
+        ("x-bsv-auth-request-id", header_request_id),
+    ] {
+        headers.insert(name, HeaderValue::from_str(&value).unwrap());
+    }
+    headers
+}
+
+async fn start_policy_server(
+    authorizer: CertificateAuthorizer,
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    MockWallet,
+    String,
+    String,
+    bsv::auth::certificates::VerifiableCertificate,
+    CertificateGate,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    use bsv::auth::certificates::VerifiableCertificate;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let issuer_key = PrivateKey::from_random().unwrap();
+    let issuer_id = issuer_key.to_public_key().to_der_hex();
+    let issuer = MockWallet::new(issuer_key);
+    let holder_key = PrivateKey::from_random().unwrap();
+    let subject = holder_key.to_public_key();
+    let holder = subject.to_der_hex();
+    let wallet = MockWallet::new(holder_key);
+    let certificate = MasterCertificate::issue_certificate_for_subject(
+        &CertificateType([42; 32]),
+        &subject,
+        IndexMap::from([("name".to_string(), "Alice".to_string())]),
+        &issuer,
+        default_get_revocation_outpoint,
+        None,
+    )
+    .await
+    .unwrap();
+    let certificate = VerifiableCertificate::new(certificate.certificate, IndexMap::new());
+    let server_key = PrivateKey::from_random().unwrap();
+    let verifier = server_key.to_public_key().to_der_hex();
+    let server = MockWallet::new(server_key);
+    let transport = Arc::new(ActixTransport::new());
+    let peer = Arc::new(Peer::new(server.clone(), transport.clone()));
+    let requested = RequestedCertificateSet {
+        certifiers: vec![issuer_id.clone()],
+        types: IndexMap::from([(B64.encode([42; 32]), vec![])]),
+    };
+    let config = AuthMiddlewareConfigBuilder::new()
+        .wallet(server)
+        .trusted_certifiers(vec![issuer_id])
+        .certificate_authorizer(authorizer)
+        .certificates_to_request(requested)
+        .build()
+        .unwrap();
+    let layer = AuthLayer::from_config(config, peer, transport)
+        .await
+        .unwrap();
+    let gate = layer.certificate_gate_ref().unwrap().clone();
+    let handler_called = Arc::new(AtomicBool::new(false));
+    let handler_called_for_route = handler_called.clone();
+    let app = Router::new()
+        .route(
+            "/",
+            get(move || {
+                let handler_called = handler_called_for_route.clone();
+                async move {
+                    handler_called.store(true, Ordering::SeqCst);
+                    "ok"
+                }
+            }),
+        )
+        .layer(layer);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (
+        url,
+        task,
+        wallet,
+        holder,
+        verifier,
+        certificate,
+        gate,
+        handler_called,
+    )
+}
+
+#[tokio::test]
+async fn rejected_authorizer_yields_signed_403_but_invalid_request_stays_unsigned() {
+    use std::sync::atomic::Ordering;
+
+    let authorizer: CertificateAuthorizer = Box::new(|_, _| {
+        Box::pin(async { CertificateAuthorizationDecision::Reject("revoked".to_string()) })
+    });
+    let (url, task, wallet, holder, verifier, certificate, gate, handler_called) =
+        start_policy_server(authorizer).await;
+    let http = reqwest::Client::new();
+    let session = handshake(&http, &url, &holder).await;
+    let proof = proof_message(&wallet, &holder, &verifier, &session, certificate, 60).await;
+    let proof_response = http
+        .post(format!("{url}.well-known/auth"))
+        .json(&proof)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(proof_response.status(), 200);
+    assert!(proof_response
+        .headers()
+        .get("x-bsv-auth-signature")
+        .is_none());
+    assert!(gate
+        .validated_for_session(&session, &holder)
+        .await
+        .is_none());
+
+    let response = http
+        .get(&url)
+        .headers(general_headers(&wallet, &holder, &verifier, &session, 61, true).await)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert!(response.headers().get("x-bsv-auth-signature").is_some());
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["code"], "ERR_CERTIFICATE_REJECTED");
+    assert_eq!(body["description"], "revoked");
+    assert!(!handler_called.load(Ordering::SeqCst));
+
+    let invalid = http
+        .get(&url)
+        .headers(general_headers(&wallet, &holder, &verifier, &session, 62, false).await)
+        .send()
+        .await
+        .unwrap();
+    assert!(!invalid.status().is_success());
+    assert_ne!(invalid.status(), 403);
+    assert_ne!(invalid.status(), 408);
+    assert!(invalid.headers().get("x-bsv-auth-signature").is_none());
+    assert!(!handler_called.load(Ordering::SeqCst));
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_and_timed_out_authorizer_yield_signed_408() {
+    use std::sync::atomic::Ordering;
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let started_for_authorizer = started.clone();
+    let authorizer: CertificateAuthorizer = Box::new(move |_, _| {
+        let started = started_for_authorizer.clone();
+        Box::pin(async move {
+            started.notify_waiters();
+            std::future::pending::<CertificateAuthorizationDecision>().await
+        })
+    });
+    let (url, task, wallet, holder, verifier, certificate, gate, handler_called) =
+        start_policy_server(authorizer).await;
+    let http = reqwest::Client::new();
+    let session = handshake(&http, &url, &holder).await;
+    let proof = proof_message(&wallet, &holder, &verifier, &session, certificate, 70).await;
+    let started_wait = started.notified();
+    let proof_http = http.clone();
+    let proof_url = url.clone();
+    let proof_request = tokio::spawn(async move {
+        proof_http
+            .post(format!("{proof_url}.well-known/auth"))
+            .json(&proof)
+            .send()
+            .await
+            .unwrap()
+    });
+    started_wait.await;
+
+    let pending = http
+        .get(&url)
+        .headers(general_headers(&wallet, &holder, &verifier, &session, 71, true).await)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pending.status(), 408);
+    assert!(pending.headers().get("x-bsv-auth-signature").is_some());
+    assert_eq!(
+        pending.json::<serde_json::Value>().await.unwrap()["code"],
+        "CERTIFICATE_TIMEOUT"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    let proof_response = proof_request.await.unwrap();
+    assert_eq!(proof_response.status(), 408);
+    assert!(proof_response
+        .headers()
+        .get("x-bsv-auth-signature")
+        .is_none());
+    let timed_out = http
+        .get(&url)
+        .headers(general_headers(&wallet, &holder, &verifier, &session, 72, true).await)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(timed_out.status(), 408);
+    assert!(timed_out.headers().get("x-bsv-auth-signature").is_some());
+    assert!(gate
+        .validated_for_session(&session, &holder)
+        .await
+        .is_none());
+    assert!(!handler_called.load(Ordering::SeqCst));
+    task.abort();
+}
+
 #[tokio::test]
 async fn hostile_frames_and_late_identity_callbacks_cannot_replace_session_authority() {
     use bsv::auth::certificates::VerifiableCertificate;
@@ -219,6 +497,9 @@ async fn hostile_frames_and_late_identity_callbacks_cannot_replace_session_autho
     let config = AuthMiddlewareConfigBuilder::new()
         .wallet(server)
         .trusted_certifiers(vec![issuer_id])
+        .certificate_authorizer(Box::new(|_, _| {
+            Box::pin(async { bsv_auth_axum_middleware::CertificateAuthorizationDecision::Accept })
+        }))
         .certificates_to_request(requested)
         .build()
         .unwrap();
@@ -418,6 +699,9 @@ async fn retained_nonempty_fields_reject_missing_substituted_and_extra_proofs() 
     let config = AuthMiddlewareConfigBuilder::new()
         .wallet(server)
         .trusted_certifiers(vec![issuer_id])
+        .certificate_authorizer(Box::new(|_, _| {
+            Box::pin(async { bsv_auth_axum_middleware::CertificateAuthorizationDecision::Accept })
+        }))
         .certificates_to_request(requested)
         .build()
         .unwrap();
@@ -534,6 +818,9 @@ async fn sdk_eviction_removes_the_corresponding_certificate_batch() {
     let config = AuthMiddlewareConfigBuilder::new()
         .wallet(server)
         .trusted_certifiers(vec![issuer_id])
+        .certificate_authorizer(Box::new(|_, _| {
+            Box::pin(async { bsv_auth_axum_middleware::CertificateAuthorizationDecision::Accept })
+        }))
         .certificates_to_request(requested)
         .build()
         .unwrap();

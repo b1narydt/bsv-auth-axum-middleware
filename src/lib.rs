@@ -15,7 +15,10 @@ pub use certificate::{
     certificate_listener_task, validate_certificate, CertRejectReason, CertificateGate,
     CertificateValidationPolicy,
 };
-pub use config::{AuthMiddlewareConfig, AuthMiddlewareConfigBuilder, OnCertificatesReceived};
+pub use config::{
+    AuthMiddlewareConfig, AuthMiddlewareConfigBuilder, CertificateAuthorizationDecision,
+    CertificateAuthorizer, OnCertificatesReceived,
+};
 pub use error::AuthMiddlewareError;
 pub use extractor::{Authenticated, AuthenticatedSession};
 pub use helpers::{extract_auth_headers, AuthHeaders};

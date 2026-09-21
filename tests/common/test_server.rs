@@ -327,6 +327,9 @@ pub async fn create_cert_test_server() -> CertTestContext {
         .allow_unauthenticated(false)
         .certificates_to_request(certs_to_request)
         .trusted_certifiers(vec![certifier_identity_hex])
+        .certificate_authorizer(Box::new(|_, _| {
+            Box::pin(async { bsv_auth_axum_middleware::CertificateAuthorizationDecision::Accept })
+        }))
         .on_certificates_received(on_certs_received)
         .build()
         .expect("failed to build cert middleware config");
