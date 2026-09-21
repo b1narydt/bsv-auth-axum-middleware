@@ -1,3 +1,20 @@
+## Unreleased — blocking certificate authorization (#552)
+
+- Add mandatory async `CertificateAuthorizer` policy decisions for every
+  certificate-gated configuration. `trusted_certifiers` without an authorizer
+  now fails construction instead of returning an ungated layer.
+- Install authorization before SDK certificate admission. Keep
+  `on_certificates_received` as post-admission observation only, and remove the
+  one-shot certificate-request observer from gate construction.
+- Return signed `403 ERR_CERTIFICATE_REJECTED` and signed
+  `408 CERTIFICATE_TIMEOUT` only for signature-verified general requests using
+  the SDK's one-use refusal capability. Invalid requests remain unsigned.
+- Bound the compatibility-only identity `pending` and `validated` maps to 1024
+  entries each with a 15-minute idle TTL; neither map is HTTP authority.
+- Cover authorizer accept, reject, pending and terminal timeout, missing
+  authorizer, pre-taken observer, unsigned invalid requests, and observer-map
+  capacity/expiry.
+
 ## 0.4.1 — session-bound HTTP certificate batches (#529)
 
 - Bind HTTP certificate authority to the exact authenticated local BRC session,
