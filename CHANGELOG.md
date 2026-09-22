@@ -3,6 +3,8 @@
 - Add mandatory async `CertificateAuthorizer` policy decisions for every
   certificate-gated configuration. `trusted_certifiers` without an authorizer
   now fails construction instead of returning an ungated layer.
+- Remove the unused public `AuthLayer::with_certificate_gate` escape hatch;
+  `AuthLayer::from_config` is the sole certificate-gated constructor.
 - Install authorization before SDK certificate admission. Keep
   `on_certificates_received` as post-admission observation only, and remove the
   one-shot certificate-request observer from gate construction.

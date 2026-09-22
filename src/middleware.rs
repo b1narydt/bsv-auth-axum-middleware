@@ -119,6 +119,10 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
     /// * `peer` - Shared Peer instance for BRC-103/104 protocol processing.
     /// * `transport` - Channel-based transport for message correlation.
     /// * `allow_unauthenticated` - Whether to allow requests without auth headers.
+    ///
+    /// This constructor always creates a layer without certificate gating.
+    /// Certificate-gated layers can only be constructed through
+    /// [`AuthLayer::from_config`], which requires a blocking authorizer.
     pub fn new(
         peer: Arc<Peer<W>>,
         transport: Arc<ActixTransport>,
@@ -130,13 +134,6 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
             allow_unauthenticated,
             certificate_gate: None,
         }
-    }
-
-    /// Set a certificate gate. Identity-only `mark_validated` does not grant
-    /// HTTP authority; normal callers obtain a policy-bound gate via `from_config`.
-    pub fn with_certificate_gate(mut self, gate: CertificateGate) -> Self {
-        self.certificate_gate = Some(gate);
-        self
     }
 
     /// The certificate gate, if certificate gating is engaged.
@@ -1033,6 +1030,15 @@ mod tests {
             .await
             .expect("from_config");
         assert!(layer.certificate_gate.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_new_is_permanently_non_certificate_gated() {
+        let transport = Arc::new(ActixTransport::new());
+        let peer = Arc::new(Peer::new(MockWallet, transport.clone()));
+
+        let layer = AuthLayer::new(peer, transport, false);
+        assert!(layer.certificate_gate_ref().is_none());
     }
 
     #[tokio::test]
