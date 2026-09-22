@@ -27,6 +27,7 @@
 //!    re-implementing certificate crypto.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -169,6 +170,7 @@ pub struct CertificateGate {
     sessions: Arc<DashMap<String, Arc<SessionCertificates>>>,
     policy: Option<Arc<CertificateValidationPolicy>>,
     admission: Arc<tokio::sync::Mutex<()>>,
+    next_provisional_owner: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -191,9 +193,73 @@ struct ObservationLimits {
 
 struct SessionCertificates {
     identity_key: String,
-    // Serialize proof processing for a single local session. The first accepted
-    // batch is immutable; replacement credentials require a fresh handshake.
-    batch: tokio::sync::Mutex<Option<Vec<VerifiableCertificate>>>,
+    // Short synchronous critical sections let a dropped SDK commit callback
+    // roll back its exact provisional owner without spawning fallible cleanup.
+    batch: std::sync::Mutex<Option<SessionCertificateBatch>>,
+}
+
+enum SessionCertificateBatch {
+    Provisional {
+        owner: u64,
+        certificates: Vec<VerifiableCertificate>,
+    },
+    Committed(Vec<VerifiableCertificate>),
+}
+
+struct ProvisionalSessionBatch {
+    record: Arc<SessionCertificates>,
+    owner: u64,
+    armed: bool,
+}
+
+impl ProvisionalSessionBatch {
+    fn promote(mut self) -> Result<(), bsv::auth::error::AuthError> {
+        use bsv::auth::error::AuthError;
+        let mut batch = self
+            .record
+            .batch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = batch.take();
+        match current {
+            Some(SessionCertificateBatch::Provisional {
+                owner,
+                certificates,
+            }) if owner == self.owner => {
+                *batch = Some(SessionCertificateBatch::Committed(certificates));
+                self.armed = false;
+                Ok(())
+            }
+            other => {
+                *batch = other;
+                Err(AuthError::CertificateValidation(
+                    "provisional certificate admission ownership changed before commit".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+impl Drop for ProvisionalSessionBatch {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut batch = self
+            .record
+            .batch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(
+            batch.as_ref(),
+            Some(SessionCertificateBatch::Provisional { owner, .. }) if *owner == self.owner
+        ) {
+            *batch = None;
+        }
+        // Deliberately keep the empty record. A later attempt reuses it, and
+        // ownership matching above guarantees this rollback can never erase a
+        // replacement provisional or committed batch.
+    }
 }
 
 impl CertificateGate {
@@ -210,6 +276,7 @@ impl CertificateGate {
             sessions: Arc::new(DashMap::new()),
             policy: None,
             admission: Arc::new(tokio::sync::Mutex::new(())),
+            next_provisional_owner: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -337,22 +404,28 @@ impl CertificateGate {
         if !session.identity_key.eq_ignore_ascii_case(identity_key) {
             return None;
         }
-        let batch = session.batch.lock().await.clone();
-        batch
+        let batch = session
+            .batch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match batch.as_ref() {
+            Some(SessionCertificateBatch::Committed(certificates)) => Some(certificates.clone()),
+            Some(SessionCertificateBatch::Provisional { .. }) | None => None,
+        }
     }
 
-    /// Commit the locally validated batch while the SDK's blocking authorizer
+    /// Stage the locally validated batch while the SDK's blocking authorizer
     /// still holds this session in `Pending` state.
     ///
-    /// The SDK cannot expose `Authorized` until this future returns `Accept`,
-    /// so a concurrent general request either receives the SDK's signed
-    /// pending refusal or observes this exact-session batch. There is no
-    /// post-dispatch authority gap for the HTTP middleware to fill.
-    pub(crate) async fn commit_authorized_session_batch<W>(
+    /// The returned attempt-owned guard is registered with the SDK, which
+    /// promotes it under the session write lock only when acceptance becomes
+    /// terminal. Cancellation, rejection, or timeout drops the guard and rolls
+    /// back only this provisional owner.
+    async fn stage_authorized_session_batch<W>(
         &self,
         peer: &bsv::auth::peer::Peer<W>,
         context: &bsv::auth::CertificateAuthorizationContext,
-    ) -> Result<(), bsv::auth::error::AuthError>
+    ) -> Result<ProvisionalSessionBatch, bsv::auth::error::AuthError>
     where
         W: bsv::wallet::interfaces::WalletInterface + Clone + 'static,
     {
@@ -425,23 +498,15 @@ impl CertificateGate {
             .or_insert_with(|| {
                 Arc::new(SessionCertificates {
                     identity_key: context.peer_identity_key.clone(),
-                    batch: tokio::sync::Mutex::new(None),
+                    batch: std::sync::Mutex::new(None),
                 })
             })
             .clone();
         drop(admission);
-        let mut batch = record.batch.lock().await;
-        if !record
-            .identity_key
-            .eq_ignore_ascii_case(&context.peer_identity_key)
-            || batch.is_some()
-        {
-            return Err(reject());
-        }
 
-        // Recheck immediately before the write. Do not await after assigning:
-        // the wrapper returns `Accept` in this poll, and until it does the SDK
-        // continues to issue only signed pending refusals.
+        // Recheck immediately before taking ownership of the empty slot. All
+        // remaining work is synchronous, so cancellation cannot strand the
+        // provisional value outside its rollback guard.
         let before_commit = peer
             .session_by_identifier(&context.session_nonce)
             .await
@@ -454,8 +519,44 @@ impl CertificateGate {
         {
             return Err(reject());
         }
-        *batch = Some(context.certificates.clone());
-        Ok(())
+        let mut batch = record
+            .batch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !record
+            .identity_key
+            .eq_ignore_ascii_case(&context.peer_identity_key)
+            || batch.is_some()
+        {
+            return Err(reject());
+        }
+
+        let owner = self.next_provisional_owner.fetch_add(1, Ordering::Relaxed);
+        *batch = Some(SessionCertificateBatch::Provisional {
+            owner,
+            certificates: context.certificates.clone(),
+        });
+        drop(batch);
+        Ok(ProvisionalSessionBatch {
+            record,
+            owner,
+            armed: true,
+        })
+    }
+
+    /// Stage and register an exact-session batch for atomic SDK admission.
+    /// Dropping the authorization attempt before SDK commit rolls back only
+    /// this attempt's provisional owner.
+    pub(crate) async fn register_authorized_session_batch<W>(
+        &self,
+        peer: &bsv::auth::peer::Peer<W>,
+        context: &bsv::auth::CertificateAuthorizationContext,
+    ) -> Result<(), bsv::auth::error::AuthError>
+    where
+        W: bsv::wallet::interfaces::WalletInterface + Clone + 'static,
+    {
+        let provisional = self.stage_authorized_session_batch(peer, context).await?;
+        context.register_certificate_admission_commit(move || provisional.promote())
     }
 
     /// Process a proof against the exact authenticated, locally nonce-selected
@@ -823,6 +924,52 @@ mod tests {
     }
 
     #[test]
+    fn provisional_batch_rollback_is_owner_scoped_and_retryable() {
+        let record = Arc::new(SessionCertificates {
+            identity_key: "peer".to_string(),
+            batch: std::sync::Mutex::new(Some(SessionCertificateBatch::Provisional {
+                owner: 1,
+                certificates: Vec::new(),
+            })),
+        });
+        let cancelled = ProvisionalSessionBatch {
+            record: record.clone(),
+            owner: 1,
+            armed: true,
+        };
+        drop(cancelled);
+        assert!(record.batch.lock().unwrap().is_none());
+
+        // A later retry owns a distinct token. Even if an old rollback guard
+        // is dropped late, it cannot erase the replacement attempt.
+        *record.batch.lock().unwrap() = Some(SessionCertificateBatch::Provisional {
+            owner: 2,
+            certificates: Vec::new(),
+        });
+        drop(ProvisionalSessionBatch {
+            record: record.clone(),
+            owner: 1,
+            armed: true,
+        });
+        assert!(matches!(
+            record.batch.lock().unwrap().as_ref(),
+            Some(SessionCertificateBatch::Provisional { owner: 2, .. })
+        ));
+
+        ProvisionalSessionBatch {
+            record: record.clone(),
+            owner: 2,
+            armed: true,
+        }
+        .promote()
+        .unwrap();
+        assert!(matches!(
+            record.batch.lock().unwrap().as_ref(),
+            Some(SessionCertificateBatch::Committed(_))
+        ));
+    }
+
+    #[test]
     fn test_release_unknown_key_does_not_panic() {
         let gate = CertificateGate::new();
         gate.release("unknown_key");
@@ -929,7 +1076,9 @@ mod tests {
                 nonce,
                 Arc::new(SessionCertificates {
                     identity_key: identity.clone(),
-                    batch: tokio::sync::Mutex::new(Some(vec![certs[index % 2].clone()])),
+                    batch: std::sync::Mutex::new(Some(SessionCertificateBatch::Committed(vec![
+                        certs[index % 2].clone(),
+                    ]))),
                 }),
             );
         }

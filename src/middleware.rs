@@ -294,7 +294,10 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
                                     "certificate admission peer is no longer available".to_string(),
                                 );
                             };
-                            match gate.commit_authorized_session_batch(&peer, &context).await {
+                            match gate
+                                .register_authorized_session_batch(&peer, &context)
+                                .await
+                            {
                                 Ok(()) => bsv::auth::CertificateAuthorizationDecision::Accept,
                                 Err(error) => {
                                     bsv::auth::CertificateAuthorizationDecision::Reject(format!(
