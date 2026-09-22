@@ -16,6 +16,10 @@
 - Install authorization before SDK certificate admission. Keep
   `on_certificates_received` as post-admission observation only, and remove the
   one-shot certificate-request observer from gate construction.
+- Commit the locally validated exact-session batch inside the blocking SDK
+  authorizer before returning `Accept`, eliminating a window where SDK
+  authority existed before the HTTP gate. Cancellation before a decision is
+  retryable; explicit rejection and authorizer timeout remain terminal.
 - Return signed `403 ERR_CERTIFICATE_REJECTED` and signed
   `408 CERTIFICATE_TIMEOUT` only for signature-verified general requests using
   the SDK's one-use refusal capability. Invalid requests remain unsigned.

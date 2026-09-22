@@ -255,6 +255,7 @@ async fn start_policy_server(
     bsv::auth::certificates::VerifiableCertificate,
     CertificateGate,
     Arc<std::sync::atomic::AtomicBool>,
+    Arc<Peer<MockWallet>>,
 ) {
     use bsv::auth::certificates::VerifiableCertificate;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -293,7 +294,7 @@ async fn start_policy_server(
         .certificates_to_request(requested)
         .build()
         .unwrap();
-    let layer = AuthLayer::from_config(config, peer, transport)
+    let layer = AuthLayer::from_config(config, peer.clone(), transport)
         .await
         .unwrap();
     let gate = layer.certificate_gate_ref().unwrap().clone();
@@ -325,6 +326,7 @@ async fn start_policy_server(
         certificate,
         gate,
         handler_called,
+        peer,
     )
 }
 
@@ -335,7 +337,7 @@ async fn rejected_authorizer_yields_signed_403_but_invalid_request_stays_unsigne
     let authorizer: CertificateAuthorizer = Box::new(|_, _| {
         Box::pin(async { CertificateAuthorizationDecision::Reject("revoked".to_string()) })
     });
-    let (url, task, wallet, holder, verifier, certificate, gate, handler_called) =
+    let (url, task, wallet, holder, verifier, certificate, gate, handler_called, _peer) =
         start_policy_server(authorizer).await;
     let http = reqwest::Client::new();
     let session = handshake(&http, &url, &holder).await;
@@ -396,7 +398,7 @@ async fn pending_and_timed_out_authorizer_yield_signed_408() {
             std::future::pending::<CertificateAuthorizationDecision>().await
         })
     });
-    let (url, task, wallet, holder, verifier, certificate, gate, handler_called) =
+    let (url, task, wallet, holder, verifier, certificate, gate, handler_called, _peer) =
         start_policy_server(authorizer).await;
     let http = reqwest::Client::new();
     let session = handshake(&http, &url, &holder).await;
@@ -447,6 +449,77 @@ async fn pending_and_timed_out_authorizer_yield_signed_408() {
         .await
         .is_none());
     assert!(!handler_called.load(Ordering::SeqCst));
+    task.abort();
+}
+
+#[tokio::test]
+async fn authorized_sdk_session_never_precedes_its_local_certificate_batch() {
+    use std::sync::atomic::Ordering;
+
+    let authorizer: CertificateAuthorizer =
+        Box::new(|_, _| Box::pin(async { CertificateAuthorizationDecision::Accept }));
+    let (url, task, wallet, holder, verifier, certificate, gate, handler_called, peer) =
+        start_policy_server(authorizer).await;
+
+    // Hold dispatch after SDK admission but before the proof endpoint returns.
+    // Before the ordering fix, local policy validation/storage happened after
+    // this listener, exposing an SDK-Authorized/local-empty interval in which
+    // a valid general request received a bare unsigned 408.
+    let observer_entered = Arc::new(tokio::sync::Notify::new());
+    let observer_release = Arc::new(tokio::sync::Notify::new());
+    let entered_for_listener = observer_entered.clone();
+    let release_for_listener = observer_release.clone();
+    peer.listen_for_certificates_received(Arc::new(move |_, _| {
+        let entered = entered_for_listener.clone();
+        let release = release_for_listener.clone();
+        Box::pin(async move {
+            entered.notify_one();
+            release.notified().await;
+            Ok(())
+        })
+    }));
+
+    let http = reqwest::Client::new();
+    let session = handshake(&http, &url, &holder).await;
+    let proof = proof_message(&wallet, &holder, &verifier, &session, certificate, 80).await;
+    let proof_http = http.clone();
+    let proof_url = url.clone();
+    let proof_request = tokio::spawn(async move {
+        proof_http
+            .post(format!("{proof_url}.well-known/auth"))
+            .json(&proof)
+            .send()
+            .await
+            .unwrap()
+    });
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        observer_entered.notified(),
+    )
+    .await
+    .expect("certificate observer did not reach the post-admission hold point");
+    assert!(gate
+        .validated_for_session(&session, &holder)
+        .await
+        .is_some());
+
+    let general = http
+        .get(&url)
+        .headers(general_headers(&wallet, &holder, &verifier, &session, 81, true).await)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(general.status(), 200);
+    assert!(general.headers().get("x-bsv-auth-signature").is_some());
+    assert!(handler_called.load(Ordering::SeqCst));
+
+    observer_release.notify_one();
+    let proof_response = tokio::time::timeout(std::time::Duration::from_secs(2), proof_request)
+        .await
+        .expect("proof dispatch stayed blocked after observer release")
+        .unwrap();
+    assert_eq!(proof_response.status(), 200);
     task.abort();
 }
 

@@ -221,6 +221,11 @@ same-shape non-empty requests or a different authorizer—are rejected by the SD
 so request-time consistency checks cannot race policy mutation. Configuration
 is validated before a compare-and-seal transaction; a rejected constructor does
 not seal the caller-owned peer and can be retried with compatible settings. The
+blocking wrapper commits the locally validated exact-session certificate batch
+before returning `Accept`, so SDK authority is never visible before the HTTP
+gate's batch. Cancelling request dispatch before the authorizer decides removes
+that pending attempt and permits an authenticated retry; explicit rejection and
+the 30-second decision timeout remain terminal for the session. The
 post-admission observer queue is capped at 1024 events; overflow is dropped
 without changing the admission decision. Application observation callbacks run
 sequentially and are cancelled after 30 seconds.

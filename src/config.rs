@@ -241,7 +241,9 @@ impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
     ///
     /// A non-empty `trusted_certifiers` set requires this callback. The SDK
     /// awaits its decision after structural validation and before marking the
-    /// exact session certificate-valid. Rejection or timeout fails closed.
+    /// exact session certificate-valid. Rejection or timeout fails closed. If
+    /// request dispatch is cancelled before the callback decides, the pending
+    /// attempt is removed and an authenticated retry may decide the session.
     pub fn certificate_authorizer(mut self, authorizer: CertificateAuthorizer) -> Self {
         self.certificate_authorizer = Some(Arc::new(authorizer));
         self

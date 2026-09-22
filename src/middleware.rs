@@ -273,12 +273,35 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
                 requested_types: requested.types.clone().into_iter().collect(),
             });
 
+            let gate = crate::certificate::CertificateGate::new().with_policy(policy.clone());
+            let gate_for_authorizer = gate.clone();
+            let peer_for_authorizer = Arc::downgrade(&peer);
+
             let sdk_authorizer: Arc<bsv::auth::CertificateAuthorizer> = Arc::new(move |context| {
                 let authorizer = authorizer.clone();
+                let gate = gate_for_authorizer.clone();
+                let peer = peer_for_authorizer.clone();
                 Box::pin(async move {
-                    match authorizer(context.peer_identity_key, context.certificates).await {
+                    match authorizer(
+                        context.peer_identity_key.clone(),
+                        context.certificates.clone(),
+                    )
+                    .await
+                    {
                         crate::config::CertificateAuthorizationDecision::Accept => {
-                            bsv::auth::CertificateAuthorizationDecision::Accept
+                            let Some(peer) = peer.upgrade() else {
+                                return bsv::auth::CertificateAuthorizationDecision::Reject(
+                                    "certificate admission peer is no longer available".to_string(),
+                                );
+                            };
+                            match gate.commit_authorized_session_batch(&peer, &context).await {
+                                Ok(()) => bsv::auth::CertificateAuthorizationDecision::Accept,
+                                Err(error) => {
+                                    bsv::auth::CertificateAuthorizationDecision::Reject(format!(
+                                        "middleware certificate policy rejected proof: {error}"
+                                    ))
+                                }
+                            }
                         }
                         crate::config::CertificateAuthorizationDecision::Reject(reason) => {
                             bsv::auth::CertificateAuthorizationDecision::Reject(reason)
@@ -293,7 +316,6 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
                         "failed to configure immutable certificate admission: {error}"
                     ))
                 })?;
-            let gate = crate::certificate::CertificateGate::new().with_policy(policy.clone());
             gate.start_session_pruner(Arc::downgrade(&peer));
             let gate_clone = gate.clone();
             let callback = config.on_certificates_received.clone();

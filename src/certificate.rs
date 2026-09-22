@@ -341,6 +341,123 @@ impl CertificateGate {
         batch
     }
 
+    /// Commit the locally validated batch while the SDK's blocking authorizer
+    /// still holds this session in `Pending` state.
+    ///
+    /// The SDK cannot expose `Authorized` until this future returns `Accept`,
+    /// so a concurrent general request either receives the SDK's signed
+    /// pending refusal or observes this exact-session batch. There is no
+    /// post-dispatch authority gap for the HTTP middleware to fill.
+    pub(crate) async fn commit_authorized_session_batch<W>(
+        &self,
+        peer: &bsv::auth::peer::Peer<W>,
+        context: &bsv::auth::CertificateAuthorizationContext,
+    ) -> Result<(), bsv::auth::error::AuthError>
+    where
+        W: bsv::wallet::interfaces::WalletInterface + Clone + 'static,
+    {
+        use bsv::auth::error::AuthError;
+        let reject = || {
+            AuthError::CertificateValidation(
+                "certificate response is not bound to the pending authenticated session"
+                    .to_string(),
+            )
+        };
+        let policy = self.policy.as_ref().ok_or_else(reject)?;
+        if context.certificates.is_empty() {
+            return Err(reject());
+        }
+        let requested = context.requested_certificates.as_ref().ok_or_else(reject)?;
+
+        // The SDK decrypts supplied keys on the nonempty path, but does not
+        // enforce that they equal the retained field request. A valid key for
+        // another field is not evidence for the field we requested.
+        for cert in &context.certificates {
+            let fields = requested
+                .types
+                .get(&BASE64.encode(cert.cert_type.0))
+                .ok_or_else(reject)?;
+            let expected: std::collections::BTreeSet<_> = fields.iter().collect();
+            let disclosed: std::collections::BTreeSet<_> = cert.keyring.keys().collect();
+            if expected != disclosed {
+                return Err(reject());
+            }
+        }
+
+        let verifier = ProtoWallet::anyone();
+        for cert in &context.certificates {
+            validate_certificate(cert, &context.peer_identity_key, policy, &verifier)
+                .await
+                .map_err(|_| reject())?;
+        }
+
+        // The context is SDK-created from its selected session. Bind the local
+        // record to that same still-live authenticated session before commit.
+        let session = peer
+            .session_by_identifier(&context.session_nonce)
+            .await
+            .ok_or_else(reject)?;
+        if session.session_nonce != context.session_nonce
+            || !session.is_authenticated
+            || session.certificates_validated
+            || !session.certificates_required
+            || !session
+                .peer_identity_key
+                .eq_ignore_ascii_case(&context.peer_identity_key)
+            || session.requested_certificates.is_none()
+            || peer
+                .session_peer_identity_for(&context.session_nonce)
+                .await
+                .as_deref()
+                != Some(context.peer_identity_key.as_str())
+        {
+            return Err(reject());
+        }
+
+        // Bound persistent records to the SDK's active session set during
+        // admission as well as while idle. Serialize prune+insert so a burst of
+        // concurrent handshakes cannot accumulate a lifetime-sized stale map.
+        let admission = self.admission.lock().await;
+        self.prune_sessions(peer).await;
+        let record = self
+            .sessions
+            .entry(context.session_nonce.clone())
+            .or_insert_with(|| {
+                Arc::new(SessionCertificates {
+                    identity_key: context.peer_identity_key.clone(),
+                    batch: tokio::sync::Mutex::new(None),
+                })
+            })
+            .clone();
+        drop(admission);
+        let mut batch = record.batch.lock().await;
+        if !record
+            .identity_key
+            .eq_ignore_ascii_case(&context.peer_identity_key)
+            || batch.is_some()
+        {
+            return Err(reject());
+        }
+
+        // Recheck immediately before the write. Do not await after assigning:
+        // the wrapper returns `Accept` in this poll, and until it does the SDK
+        // continues to issue only signed pending refusals.
+        let before_commit = peer
+            .session_by_identifier(&context.session_nonce)
+            .await
+            .ok_or_else(reject)?;
+        if !before_commit.is_authenticated
+            || before_commit.certificates_validated
+            || !before_commit
+                .peer_identity_key
+                .eq_ignore_ascii_case(&context.peer_identity_key)
+        {
+            return Err(reject());
+        }
+        *batch = Some(context.certificates.clone());
+        Ok(())
+    }
+
     /// Process a proof against the exact authenticated, locally nonce-selected
     /// session. A frame's identity/nonce is a selector, never evidence: the SDK
     /// verifies the nonce, signature, replay and retained certificate request.
@@ -359,12 +476,15 @@ impl CertificateGate {
                 "certificate response is not bound to a pending authenticated session".to_string(),
             )
         };
-        let nonce = message.your_nonce.as_deref().ok_or_else(reject)?;
+        let nonce = message.your_nonce.clone().ok_or_else(reject)?;
         let identity = peer
-            .session_peer_identity_for(nonce)
+            .session_peer_identity_for(&nonce)
             .await
             .ok_or_else(reject)?;
-        let session = peer.session_by_identifier(nonce).await.ok_or_else(reject)?;
+        let session = peer
+            .session_by_identifier(&nonce)
+            .await
+            .ok_or_else(reject)?;
         if session.session_nonce != nonce
             || !session.is_authenticated
             || !identity.eq_ignore_ascii_case(&message.identity_key)
@@ -373,17 +493,16 @@ impl CertificateGate {
         {
             return Err(reject());
         }
-        let policy = self.policy.as_ref().ok_or_else(reject)?;
         let certs = message
             .certificates
-            .clone()
+            .as_ref()
             .filter(|c| !c.is_empty())
             .ok_or_else(reject)?;
         // The SDK decrypts the supplied keys on the nonempty path, but does
         // not enforce that they equal the retained field request. A valid key
         // for a different field is not evidence for the field we requested.
         let requested = session.requested_certificates.as_ref().ok_or_else(reject)?;
-        for cert in &certs {
+        for cert in certs {
             let fields = requested
                 .types
                 .get(&BASE64.encode(cert.cert_type.0))
@@ -394,37 +513,15 @@ impl CertificateGate {
                 return Err(reject());
             }
         }
-        // Bound persistent records to the SDK's active session set during
-        // admission as well as while idle. Serialize prune+insert so a burst of
-        // concurrent handshakes cannot accumulate a lifetime-sized stale map.
-        let admission = self.admission.lock().await;
-        self.prune_sessions(peer).await;
-        let record = self
-            .sessions
-            .entry(nonce.to_string())
-            .or_insert_with(|| {
-                Arc::new(SessionCertificates {
-                    identity_key: identity.clone(),
-                    batch: tokio::sync::Mutex::new(None),
-                })
-            })
-            .clone();
-        drop(admission);
-        let mut batch = record.batch.lock().await;
-        if record.identity_key != identity || batch.is_some() {
-            return Err(reject());
-        }
-        // Direct dispatch awaits cryptographic validation. Never infer success
-        // from callback timing, sender fields, or certificates_validated alone.
-        peer.dispatch_message(message.clone()).await?;
-        let verifier = ProtoWallet::anyone();
-        for cert in &certs {
-            validate_certificate(cert, &identity, policy, &verifier)
-                .await
-                .map_err(|_| reject())?;
-        }
-        let after = peer.session_by_identifier(nonce).await.ok_or_else(reject)?;
-        if peer.session_peer_identity_for(nonce).await.as_deref() != Some(identity.as_str())
+        // Direct dispatch performs structural validation and blocks in the SDK
+        // authorizer. That wrapper commits the local exact-session batch before
+        // returning `Accept`, so SDK authority cannot become visible first.
+        peer.dispatch_message(message).await?;
+        let after = peer
+            .session_by_identifier(&nonce)
+            .await
+            .ok_or_else(reject)?;
+        if peer.session_peer_identity_for(&nonce).await.as_deref() != Some(identity.as_str())
             || after.session_nonce != nonce
             || after.peer_nonce != session.peer_nonce
             || !after.is_authenticated
@@ -432,7 +529,13 @@ impl CertificateGate {
         {
             return Err(reject());
         }
-        *batch = Some(certs);
+        if self
+            .validated_for_session(&nonce, &identity)
+            .await
+            .is_none()
+        {
+            return Err(reject());
+        }
         Ok(())
     }
 
