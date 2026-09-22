@@ -215,6 +215,14 @@ maps are independently capped at 1024 identities and expire after 15 minutes.
 In particular, calling `mark_validated(identity, certs)` cannot release a
 session's HTTP gate.
 
+Construction atomically seals the SDK peer's certificate request and blocking
+authorizer at an exact monotonic generation. Later replacements—including
+same-shape non-empty requests or a different authorizer—are rejected by the SDK,
+so request-time consistency checks cannot race policy mutation. The
+post-admission observer queue is capped at 1024 events; overflow is dropped
+without changing the admission decision. Application observation callbacks run
+sequentially and are cancelled after 30 seconds.
+
 An authentic general request blocked by a rejected authorizer receives a signed
 `403 ERR_CERTIFICATE_REJECTED`; a pending or timed-out decision receives a signed
 `408 CERTIFICATE_TIMEOUT`. The SDK issues the refusal-only signing capability

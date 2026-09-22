@@ -13,7 +13,8 @@ pub mod transport;
 
 pub use certificate::{
     certificate_listener_task, validate_certificate, CertRejectReason, CertificateGate,
-    CertificateValidationPolicy,
+    CertificateValidationPolicy, CERTIFICATE_OBSERVER_CALLBACK_TIMEOUT,
+    CERTIFICATE_OBSERVER_EVENT_CAPACITY,
 };
 pub use config::{
     AuthMiddlewareConfig, AuthMiddlewareConfigBuilder, CertificateAuthorizationDecision,

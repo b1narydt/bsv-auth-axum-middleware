@@ -8,8 +8,9 @@
 //!
 //! ## Validation (TS parity + strictly-better)
 //!
-//! For every incoming certificate the listener enforces, BEFORE releasing the
-//! gate (mirrors `ts-sdk` `validateCertificates.ts` / `Peer.ts:873-914`):
+//! For every incoming certificate, synchronous session admission and the
+//! post-admission listener enforce (mirrors `ts-sdk`
+//! `validateCertificates.ts` / `Peer.ts:873-914`):
 //!
 //! 1. **Subject-bind** — `cert.subject == sender.identityKey`
 //!    (ts `validateCertificates.ts:25-29`).
@@ -37,6 +38,7 @@ use bsv::wallet::interfaces::Certificate;
 use bsv::wallet::proto_wallet::ProtoWallet;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::Notify;
 
 use crate::config::OnCertificatesReceived;
@@ -47,6 +49,14 @@ pub const OBSERVATION_IDENTITY_CAPACITY: usize = 1024;
 
 /// Maximum idle age for compatibility-only identity observations.
 pub const OBSERVATION_IDENTITY_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Maximum number of post-admission certificate events queued for legacy
+/// identity observation and application callbacks.
+pub const CERTIFICATE_OBSERVER_EVENT_CAPACITY: usize = 1024;
+
+/// Maximum duration of one post-admission application callback. Callbacks run
+/// sequentially, so concurrency is fixed at one and never grows with load.
+pub const CERTIFICATE_OBSERVER_CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Validation policy + result
@@ -525,17 +535,19 @@ impl Default for CertificateGate {
 /// the sender against `policy` (subject-bind + certifier PIN + type PIN +
 /// certifier signature). Only if the batch is non-empty and *all* certificates
 /// pass does it:
-/// 1. Invoke the optional `on_certificates_received` callback (fire-and-forget),
-///    with the validated certificates.
-/// 2. Record the validated certificates and release the per-identity gate
-///    ([`CertificateGate::mark_validated`]).
+/// 1. Record the validated certificates and release the compatibility-only
+///    per-identity observation ([`CertificateGate::mark_validated`]).
+/// 2. Await the optional `on_certificates_received` callback sequentially for
+///    at most [`CERTIFICATE_OBSERVER_CALLBACK_TIMEOUT`]. No callback task is
+///    spawned, so callback concurrency is always one.
 ///
-/// On any validation failure (or an empty batch) the gate is NOT released — the
-/// waiting request times out and is rejected.
+/// On any listener validation failure (or an empty batch), no legacy identity
+/// observation or application callback is emitted. The SDK's earlier
+/// session-bound admission decision is never rolled back or changed here.
 ///
 /// Exits when the certificate channel is closed.
 pub async fn certificate_listener_task(
-    mut cert_rx: mpsc::UnboundedReceiver<(String, Vec<VerifiableCertificate>)>,
+    mut cert_rx: mpsc::Receiver<(String, Vec<VerifiableCertificate>)>,
     gate: CertificateGate,
     policy: Arc<CertificateValidationPolicy>,
     callback: Option<Arc<OnCertificatesReceived>>,
@@ -556,7 +568,7 @@ pub async fn certificate_listener_task(
                 if certs.is_empty() {
                     tracing::warn!(
                         sender = %sender_key,
-                        "no certificates provided -- gate NOT released"
+                        "no certificates provided -- observation dropped"
                     );
                     continue;
                 }
@@ -571,7 +583,7 @@ pub async fn certificate_listener_task(
                         tracing::warn!(
                             sender = %sender_key,
                             ?reason,
-                            "certificate REJECTED -- gate NOT released"
+                            "certificate observation rejected"
                         );
                         all_valid = false;
                         break;
@@ -584,22 +596,30 @@ pub async fn certificate_listener_task(
                 tracing::info!(
                     sender = %sender_key,
                     count = certs.len(),
-                    "all certificates validated -- releasing gate"
+                    "all certificates validated -- recording observation"
                 );
 
-                // 1. Invoke callback fire-and-forget with validated certs.
-                if let Some(ref cb) = callback {
-                    let cb = Arc::clone(cb);
-                    let key = sender_key.clone();
-                    let certs_for_cb = certs.clone();
-                    tokio::spawn(async move {
-                        let fut = cb(key, certs_for_cb);
-                        fut.await;
-                    });
-                }
+                // This identity-only observation is not HTTP authority and has
+                // already passed SDK admission before reaching this queue.
+                gate.mark_validated(&sender_key, certs.clone());
 
-                // 2. Record validated certs + release the gate.
-                gate.mark_validated(&sender_key, certs);
+                // Await one callback at a time with a fixed deadline. Keeping
+                // it in this task (rather than spawning) bounds concurrency.
+                if let Some(ref cb) = callback {
+                    if !invoke_certificate_observer(
+                        cb,
+                        sender_key.clone(),
+                        certs,
+                        CERTIFICATE_OBSERVER_CALLBACK_TIMEOUT,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            sender = %sender_key,
+                            "post-admission certificate observer timed out"
+                        );
+                    }
+                }
             }
             None => {
                 tracing::debug!("certificate receiver closed");
@@ -608,6 +628,44 @@ pub async fn certificate_listener_task(
         }
     }
     tracing::debug!("certificate listener task exiting");
+}
+
+async fn invoke_certificate_observer(
+    callback: &Arc<OnCertificatesReceived>,
+    sender_key: String,
+    certificates: Vec<VerifiableCertificate>,
+    timeout: Duration,
+) -> bool {
+    tokio::time::timeout(timeout, callback(sender_key, certificates))
+        .await
+        .is_ok()
+}
+
+/// Enqueue one compatibility-only observer event without applying backpressure
+/// to SDK admission. A full or closed queue drops the observation; admission
+/// has already completed and is never rolled back or changed by this result.
+pub(crate) fn try_enqueue_certificate_observation(
+    cert_tx: &mpsc::Sender<(String, Vec<VerifiableCertificate>)>,
+    event: (String, Vec<VerifiableCertificate>),
+) -> bool {
+    match cert_tx.try_send(event) {
+        Ok(()) => true,
+        Err(TrySendError::Full((sender_key, _))) => {
+            tracing::warn!(
+                sender = %sender_key,
+                capacity = cert_tx.max_capacity(),
+                "post-admission certificate observer queue full; dropping observation"
+            );
+            false
+        }
+        Err(TrySendError::Closed((sender_key, _))) => {
+            tracing::warn!(
+                sender = %sender_key,
+                "post-admission certificate observer closed; dropping observation"
+            );
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -692,6 +750,44 @@ mod tests {
         gate.register("trigger-prune");
         assert!(!gate.pending.contains_key("pending"));
         assert!(gate.validated_for("validated").is_none());
+    }
+
+    #[test]
+    fn observer_event_queue_drops_over_capacity_without_growing() {
+        let (cert_tx, mut cert_rx) = mpsc::channel(2);
+        assert!(try_enqueue_certificate_observation(
+            &cert_tx,
+            ("one".to_string(), Vec::new())
+        ));
+        assert!(try_enqueue_certificate_observation(
+            &cert_tx,
+            ("two".to_string(), Vec::new())
+        ));
+        assert!(!try_enqueue_certificate_observation(
+            &cert_tx,
+            ("dropped".to_string(), Vec::new())
+        ));
+
+        assert_eq!(cert_rx.try_recv().unwrap().0, "one");
+        assert_eq!(cert_rx.try_recv().unwrap().0, "two");
+        assert!(matches!(
+            cert_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn observer_callback_is_cancelled_at_fixed_deadline() {
+        let callback: OnCertificatesReceived = Box::new(|_, _| Box::pin(std::future::pending()));
+        assert!(
+            !invoke_certificate_observer(
+                &Arc::new(callback),
+                "identity".to_string(),
+                Vec::new(),
+                Duration::from_millis(10),
+            )
+            .await
+        );
     }
 
     #[tokio::test]
@@ -893,11 +989,11 @@ mod tests {
 
         let gate = CertificateGate::new();
         let _n = gate.register(&sender);
-        let (cert_tx, cert_rx) = mpsc::unbounded_channel();
+        let (cert_tx, cert_rx) = mpsc::channel(4);
 
         let task = tokio::spawn(certificate_listener_task(cert_rx, gate.clone(), pol, None));
 
-        cert_tx.send((sender.clone(), vec![cert])).unwrap();
+        cert_tx.send((sender.clone(), vec![cert])).await.unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(gate.validated_for(&sender).is_some());
 
@@ -913,11 +1009,14 @@ mod tests {
         });
         let gate = CertificateGate::new();
         let _n = gate.register("sender_1");
-        let (cert_tx, cert_rx) = mpsc::unbounded_channel();
+        let (cert_tx, cert_rx) = mpsc::channel(4);
 
         let task = tokio::spawn(certificate_listener_task(cert_rx, gate.clone(), pol, None));
 
-        cert_tx.send(("sender_1".to_string(), vec![])).unwrap();
+        cert_tx
+            .send(("sender_1".to_string(), vec![]))
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             gate.validated_for("sender_1").is_none(),
@@ -950,7 +1049,7 @@ mod tests {
         });
         let gate = CertificateGate::new();
         let _n = gate.register(&sender);
-        let (cert_tx, cert_rx) = mpsc::unbounded_channel();
+        let (cert_tx, cert_rx) = mpsc::channel(4);
 
         let task = tokio::spawn(certificate_listener_task(
             cert_rx,
@@ -959,7 +1058,7 @@ mod tests {
             Some(Arc::new(callback)),
         ));
 
-        cert_tx.send((sender.clone(), vec![cert])).unwrap();
+        cert_tx.send((sender.clone(), vec![cert])).await.unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(
             called.load(Ordering::SeqCst),
@@ -973,7 +1072,7 @@ mod tests {
     #[tokio::test]
     async fn test_listener_exits_when_certificate_channel_closes() {
         let gate = CertificateGate::new();
-        let (cert_tx, cert_rx) = mpsc::unbounded_channel::<(String, Vec<VerifiableCertificate>)>();
+        let (cert_tx, cert_rx) = mpsc::channel::<(String, Vec<VerifiableCertificate>)>(4);
         let pol = Arc::new(CertificateValidationPolicy::default());
 
         let task = tokio::spawn(certificate_listener_task(cert_rx, gate, pol, None));

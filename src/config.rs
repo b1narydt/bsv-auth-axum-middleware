@@ -46,7 +46,10 @@ pub type CertificateAuthorizer = Box<
 /// Receives `(sender_identity_key, certificates)`. When configured through
 /// [`AuthMiddlewareConfigBuilder`], the callback is scheduled only after SDK
 /// structural validation and blocking application authorization have succeeded.
-/// It is observation only and cannot grant or veto session authority.
+/// It is observation only and cannot grant or veto session authority. Events
+/// use a bounded queue; overload drops observations without changing admission.
+/// Callbacks run sequentially with a fixed timeout, so their task count cannot
+/// grow with handshake volume.
 pub type OnCertificatesReceived =
     Box<dyn Fn(String, Vec<VerifiableCertificate>) -> BoxFuture<'static, ()> + Send + Sync>;
 

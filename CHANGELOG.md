@@ -6,8 +6,11 @@
 - Remove the unused public `AuthLayer::with_certificate_gate` escape hatch;
   `AuthLayer::from_config` is the sole certificate-gated constructor. The
   no-certificate `AuthLayer::new` constructor is now fallible and rejects a
-  preconfigured certificate-requesting SDK peer; request-time consistency
-  checks also fail closed if the shared peer is reconfigured later.
+  preconfigured certificate-requesting SDK peer; request-time checks require
+  the exact sealed SDK configuration captured by construction.
+- Atomically configure and seal the SDK certificate request and authorizer at
+  construction, capturing an exact monotonic generation. Same-shape request or
+  authorizer replacement is rejected, eliminating the check/dispatch race.
 - Install authorization before SDK certificate admission. Keep
   `on_certificates_received` as post-admission observation only, and remove the
   one-shot certificate-request observer from gate construction.
@@ -16,6 +19,9 @@
   the SDK's one-use refusal capability. Invalid requests remain unsigned.
 - Bound the compatibility-only identity `pending` and `validated` maps to 1024
   entries each with a 15-minute idle TTL; neither map is HTTP authority.
+- Bound the post-admission observer queue to 1024 events. Overflow is dropped
+  as non-authoritative observation only; callbacks run sequentially without
+  spawned tasks and are cancelled after 30 seconds.
 - Cover authorizer accept, reject, pending and terminal timeout, missing
   authorizer, pre-taken observer, unsigned invalid requests, and observer-map
   capacity/expiry.

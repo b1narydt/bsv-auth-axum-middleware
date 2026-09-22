@@ -73,7 +73,7 @@ async fn run_listener_once(
 ) -> CertificateGate {
     let gate = CertificateGate::new();
     let _notify = gate.register(sender);
-    let (cert_tx, cert_rx) = mpsc::unbounded_channel();
+    let (cert_tx, cert_rx) = mpsc::channel(4);
 
     let task = tokio::spawn(certificate_listener_task(
         cert_rx,
@@ -82,7 +82,7 @@ async fn run_listener_once(
         None,
     ));
 
-    cert_tx.send((sender.to_string(), certs)).unwrap();
+    cert_tx.send((sender.to_string(), certs)).await.unwrap();
     // Give the listener time to validate + (maybe) release.
     tokio::time::sleep(Duration::from_millis(80)).await;
 
