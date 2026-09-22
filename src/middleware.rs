@@ -132,7 +132,15 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
         transport: Arc<ActixTransport>,
         allow_unauthenticated: bool,
     ) -> Result<Self, AuthMiddlewareError> {
-        let certificate_admission = peer.seal_certificate_admission_configuration();
+        let candidate = peer.certificate_admission_configuration();
+        Self::validate_certificate_shape(false, candidate)?;
+        let certificate_admission = peer
+            .seal_certificate_admission_configuration_if_unchanged(candidate)
+            .map_err(|error| {
+                AuthMiddlewareError::Config(format!(
+                    "Peer certificate admission changed during construction: {error}"
+                ))
+            })?;
         let layer = Self {
             peer,
             transport,
@@ -149,11 +157,18 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
         if sdk != self.certificate_admission || !sdk.sealed {
             return Err(AuthMiddlewareError::Config(
                 "Peer certificate admission configuration does not match the sealed middleware generation"
-                    .to_string(),
+                .to_string(),
             ));
         }
+        Self::validate_certificate_shape(self.certificate_gate.is_some(), sdk)
+    }
+
+    fn validate_certificate_shape(
+        gate_configured: bool,
+        sdk: CertificateAdmissionConfiguration,
+    ) -> Result<(), AuthMiddlewareError> {
         match (
-            self.certificate_gate.is_some(),
+            gate_configured,
             sdk.certificates_required,
             sdk.authorizer_configured,
         ) {
@@ -222,7 +237,16 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
 
         let (certificate_gate, certificate_admission) = if config.trusted_certifiers.is_empty() {
             // Empty trusted set => certificates NOT required; no gate.
-            (None, peer.seal_certificate_admission_configuration())
+            let candidate = peer.certificate_admission_configuration();
+            Self::validate_certificate_shape(false, candidate)?;
+            let sealed = peer
+                .seal_certificate_admission_configuration_if_unchanged(candidate)
+                .map_err(|error| {
+                    AuthMiddlewareError::Config(format!(
+                        "Peer certificate admission changed during construction: {error}"
+                    ))
+                })?;
+            (None, sealed)
         } else {
             let authorizer = config.certificate_authorizer.clone().ok_or_else(|| {
                 AuthMiddlewareError::Config(
@@ -1119,7 +1143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_rejects_preconfigured_certificate_request_without_authorizer() {
+    async fn test_rejected_plain_construction_leaves_preconfigured_peer_recoverable() {
         let transport = Arc::new(ActixTransport::new());
         let peer = Arc::new(Peer::new(MockWallet, transport.clone()));
         peer.set_certificates_to_request(RequestedCertificateSet {
@@ -1127,11 +1151,64 @@ mod tests {
             types: Default::default(),
         });
 
-        let result = AuthLayer::new(peer, transport, false);
+        let result = AuthLayer::new(peer.clone(), transport.clone(), false);
         let Err(AuthMiddlewareError::Config(reason)) = result else {
             panic!("preconfigured certificate request must not bypass from_config");
         };
         assert!(reason.contains("already requires certificates"));
+        assert!(
+            !peer.certificate_admission_configuration().sealed,
+            "failed constructor must not seal caller-owned Peer"
+        );
+
+        let config = AuthMiddlewareConfigBuilder::new()
+            .wallet(MockWallet)
+            .trusted_certifiers(vec!["02aabbccdd".to_string()])
+            .certificate_authorizer(Box::new(|_, _| {
+                Box::pin(async { crate::CertificateAuthorizationDecision::Accept })
+            }))
+            .build()
+            .unwrap();
+        let recovered = AuthLayer::from_config(config, peer, transport)
+            .await
+            .expect("same Peer remains configurable after rejected plain construction");
+        assert!(recovered.certificate_gate_ref().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_incompatible_empty_trust_config_leaves_peer_recoverable() {
+        let transport = Arc::new(ActixTransport::new());
+        let peer = Arc::new(Peer::new(MockWallet, transport.clone()));
+        peer.set_certificates_to_request(RequestedCertificateSet {
+            certifiers: vec!["02aabbccdd".to_string()],
+            types: Default::default(),
+        });
+        let incompatible = AuthMiddlewareConfigBuilder::new()
+            .wallet(MockWallet)
+            .build()
+            .unwrap();
+
+        assert!(matches!(
+            AuthLayer::from_config(incompatible, peer.clone(), transport.clone()).await,
+            Err(AuthMiddlewareError::Config(_))
+        ));
+        assert!(
+            !peer.certificate_admission_configuration().sealed,
+            "rejected empty-trust configuration must not seal caller-owned Peer"
+        );
+
+        let compatible = AuthMiddlewareConfigBuilder::new()
+            .wallet(MockWallet)
+            .trusted_certifiers(vec!["02aabbccdd".to_string()])
+            .certificate_authorizer(Box::new(|_, _| {
+                Box::pin(async { crate::CertificateAuthorizationDecision::Accept })
+            }))
+            .build()
+            .unwrap();
+        let recovered = AuthLayer::from_config(compatible, peer, transport)
+            .await
+            .expect("same Peer remains configurable after rejected empty-trust construction");
+        assert!(recovered.certificate_gate_ref().is_some());
     }
 
     #[tokio::test]

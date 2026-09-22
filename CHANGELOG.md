@@ -11,6 +11,8 @@
 - Atomically configure and seal the SDK certificate request and authorizer at
   construction, capturing an exact monotonic generation. Same-shape request or
   authorizer replacement is rejected, eliminating the check/dispatch race.
+  Rejected constructors validate before conditional sealing, leaving a
+  caller-owned `Peer` mutable and recoverable for a compatible retry.
 - Install authorization before SDK certificate admission. Keep
   `on_certificates_received` as post-admission observation only, and remove the
   one-shot certificate-request observer from gate construction.

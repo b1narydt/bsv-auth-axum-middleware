@@ -218,7 +218,9 @@ session's HTTP gate.
 Construction atomically seals the SDK peer's certificate request and blocking
 authorizer at an exact monotonic generation. Later replacements—including
 same-shape non-empty requests or a different authorizer—are rejected by the SDK,
-so request-time consistency checks cannot race policy mutation. The
+so request-time consistency checks cannot race policy mutation. Configuration
+is validated before a compare-and-seal transaction; a rejected constructor does
+not seal the caller-owned peer and can be retried with compatible settings. The
 post-admission observer queue is capped at 1024 events; overflow is dropped
 without changing the admission decision. Application observation callbacks run
 sequentially and are cancelled after 30 seconds.
