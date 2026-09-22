@@ -34,8 +34,8 @@ Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bsv-auth-axum-middleware = "0.1"
-bsv-sdk = { version = "0.3", features = ["network"] }
+bsv-auth-axum-middleware = "0.5"
+bsv-sdk = { version = "0.8.1", features = ["network"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 ```

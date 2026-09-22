@@ -127,12 +127,37 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
         peer: Arc<Peer<W>>,
         transport: Arc<ActixTransport>,
         allow_unauthenticated: bool,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, AuthMiddlewareError> {
+        let layer = Self {
             peer,
             transport,
             allow_unauthenticated,
             certificate_gate: None,
+        };
+        layer.validate_certificate_configuration()?;
+        Ok(layer)
+    }
+
+    fn validate_certificate_configuration(&self) -> Result<(), AuthMiddlewareError> {
+        let sdk = self.peer.certificate_admission_configuration();
+        match (
+            self.certificate_gate.is_some(),
+            sdk.certificates_required,
+            sdk.authorizer_configured,
+        ) {
+            (false, true, _) => Err(AuthMiddlewareError::Config(
+                "Peer already requires certificates; construct the layer with AuthLayer::from_config and a certificate_authorizer"
+                    .to_string(),
+            )),
+            (true, false, _) => Err(AuthMiddlewareError::Config(
+                "middleware certificate gate is engaged but the Peer has no required certificate request"
+                    .to_string(),
+            )),
+            (true, true, false) => Err(AuthMiddlewareError::Config(
+                "middleware certificate gate is engaged but the Peer has no certificate authorizer"
+                    .to_string(),
+            )),
+            _ => Ok(()),
         }
     }
 
@@ -249,12 +274,14 @@ impl<W: WalletInterface + Clone + 'static> AuthLayer<W> {
             Some(gate)
         };
 
-        Ok(Self {
+        let layer = Self {
             peer,
             transport,
             allow_unauthenticated: config.allow_unauthenticated,
             certificate_gate,
-        })
+        };
+        layer.validate_certificate_configuration()?;
+        Ok(layer)
     }
 }
 
@@ -313,6 +340,27 @@ where
         let certificate_gate = self.certificate_gate.clone();
 
         Box::pin(async move {
+            let sdk_certificate_config = peer.certificate_admission_configuration();
+            let certificate_config_valid = match certificate_gate.is_some() {
+                true => {
+                    sdk_certificate_config.certificates_required
+                        && sdk_certificate_config.authorizer_configured
+                }
+                false => !sdk_certificate_config.certificates_required,
+            };
+            if !certificate_config_valid {
+                error!(
+                    gate_configured = certificate_gate.is_some(),
+                    sdk_certificates_required = sdk_certificate_config.certificates_required,
+                    sdk_authorizer_configured = sdk_certificate_config.authorizer_configured,
+                    "certificate admission configuration changed after layer construction"
+                );
+                return Ok(AuthMiddlewareError::Config(
+                    "certificate admission configuration is inconsistent with the middleware layer"
+                        .to_string(),
+                )
+                .into_response());
+            }
             let path = req.uri().path().to_string();
 
             // Branch 1: Handshake at /.well-known/auth
@@ -1037,8 +1085,54 @@ mod tests {
         let transport = Arc::new(ActixTransport::new());
         let peer = Arc::new(Peer::new(MockWallet, transport.clone()));
 
-        let layer = AuthLayer::new(peer, transport, false);
+        let layer = AuthLayer::new(peer, transport, false).expect("plain auth layer");
         assert!(layer.certificate_gate_ref().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_new_rejects_preconfigured_certificate_request_without_authorizer() {
+        let transport = Arc::new(ActixTransport::new());
+        let peer = Arc::new(Peer::new(MockWallet, transport.clone()));
+        peer.set_certificates_to_request(RequestedCertificateSet {
+            certifiers: vec!["02aabbccdd".to_string()],
+            types: Default::default(),
+        });
+
+        let result = AuthLayer::new(peer, transport, false);
+        let Err(AuthMiddlewareError::Config(reason)) = result else {
+            panic!("preconfigured certificate request must not bypass from_config");
+        };
+        assert!(reason.contains("already requires certificates"));
+    }
+
+    #[tokio::test]
+    async fn test_late_peer_certificate_reconfiguration_fails_closed() {
+        use axum::body::to_bytes;
+        use axum::routing::get;
+        use axum::Router;
+        use http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let transport = Arc::new(ActixTransport::new());
+        let peer = Arc::new(Peer::new(MockWallet, transport.clone()));
+        let layer = AuthLayer::new(peer.clone(), transport, true).expect("plain auth layer");
+        peer.set_certificates_to_request(RequestedCertificateSet {
+            certifiers: vec!["02aabbccdd".to_string()],
+            types: Default::default(),
+        });
+        let app = Router::new()
+            .route("/", get(|| async { "must not run" }))
+            .layer(layer);
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response.headers().get("x-bsv-auth-signature").is_none());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "ERR_CONFIG");
     }
 
     #[tokio::test]
