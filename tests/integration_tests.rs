@@ -818,6 +818,32 @@ async fn test_15_multiple_requests_survive_session_reset() {
 // Concurrency test (Rust-specific)
 // ---------------------------------------------------------------------------
 
+/// Regression: the server's SDK receive loop must live on the dedicated
+/// server runtime, not on the short-lived runtime that called the helper.
+#[test]
+fn test_server_peer_outlives_creator_runtime() {
+    init_tracing();
+    let server_url = std::thread::spawn(|| {
+        tokio::runtime::Runtime::new()
+            .expect("create disposable creator runtime")
+            .block_on(create_test_server())
+    })
+    .join()
+    .expect("creator thread");
+
+    tokio::runtime::Runtime::new()
+        .expect("create client runtime")
+        .block_on(async move {
+            let client_wallet =
+                MockWallet::new(PrivateKey::from_random().expect("generate client key"));
+            let response = AuthFetch::new(client_wallet)
+                .fetch(&format!("{server_url}/"), "GET", None, None)
+                .await
+                .expect("server Peer must survive creator runtime drop");
+            assert_eq!(response.status, 200);
+        });
+}
+
 /// Test: Concurrent authenticated requests all succeed.
 ///
 /// Validates that Arc<Mutex<Peer>> works correctly under concurrent
