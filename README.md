@@ -7,9 +7,9 @@
 
 BSV BRC-104 (BRC-103 over HTTP) mutual authentication middleware for axum. This crate is a
 port of [`bsv-auth-actix-middleware`](https://crates.io/crates/bsv-auth-actix-middleware)
-to axum 0.8 + tower 0.5. The wire format, config surface, and error response
-bodies are identical to the actix sibling and to the TypeScript
-`@bsv/auth-express-middleware` reference implementation.
+to axum 0.8 + tower 0.5. Its core wire format follows the actix sibling and
+the TypeScript `@bsv/auth-express-middleware` reference implementation, with a
+fail-closed Rust certificate-policy extension described below.
 
 ## What is BRC-103/104?
 
@@ -34,8 +34,8 @@ Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bsv-auth-axum-middleware = "0.1"
-bsv-sdk = { version = "0.3", features = ["network"] }
+bsv-auth-axum-middleware = "0.5"
+bsv-sdk = { version = "0.8.1", features = ["network"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 ```
@@ -67,12 +67,12 @@ async fn main() {
 
     // 3. Create transport and peer.
     let transport = Arc::new(ActixTransport::new());
-    let peer = Arc::new(tokio::sync::Mutex::new(
-        Peer::new(wallet, transport.clone()),
-    ));
+    let peer = Arc::new(Peer::new(wallet, transport.clone()));
 
     // 4. Build the auth layer (spawns certificate listener if configured).
-    let auth_layer = AuthLayer::from_config(config, peer, transport).await;
+    let auth_layer = AuthLayer::from_config(config, peer, transport)
+        .await
+        .expect("valid auth layer");
 
     // 5. Apply to router.
     let app = Router::new()
@@ -100,8 +100,10 @@ let config = AuthMiddlewareConfigBuilder::new()
     .wallet(wallet)                              // Required: WalletInterface impl
     .allow_unauthenticated(false)                // Optional: reject unauth requests (default)
     .certificates_to_request(certificate_set)    // Optional: request certs from peers
+    .trusted_certifiers(certifier_keys)           // Nonempty: engage certificate gate
+    .certificate_authorizer(authorizer)           // Required with trusted certifiers
     .session_manager(session_mgr)                // Optional: track authenticated sessions
-    .on_certificates_received(callback)          // Optional: handle received certificates
+    .on_certificates_received(callback)          // Optional: post-admission observation
     .log_level(tracing::Level::INFO)             // Optional: install default tracing subscriber
     .build()
     .expect("valid config");
@@ -114,8 +116,10 @@ let config = AuthMiddlewareConfigBuilder::new()
 | `wallet` | `W: WalletInterface` | *required* | Wallet used for signing, verification, and key operations |
 | `allow_unauthenticated` | `bool` | `false` | When `true`, requests without auth headers pass through to the handler |
 | `certificates_to_request` | `RequestedCertificateSet` | `None` | Certificate types to request from peers after handshake |
+| `trusted_certifiers` | `Vec<String>` | empty | Trusted certifier public keys; a nonempty set engages mandatory certificate admission |
+| `certificate_authorizer` | `CertificateAuthorizer` | `None` | Blocking async policy decision; required when `trusted_certifiers` is nonempty |
 | `session_manager` | `SessionManager` | `None` | Manages authenticated sessions for repeat connections |
-| `on_certificates_received` | `OnCertificatesReceived` | `None` | Async callback invoked when certificates arrive from a peer |
+| `on_certificates_received` | `OnCertificatesReceived` | `None` | Post-admission async observation callback; it cannot grant or veto authority |
 | `log_level` | `tracing::Level` | `None` | When set, installs a default `tracing_subscriber::fmt` subscriber at that level |
 
 ## Authentication Flow
@@ -148,6 +152,7 @@ configuration option to require specific certificates from peers:
 
 ```rust,ignore
 use bsv::auth::types::RequestedCertificateSet;
+use bsv_auth_axum_middleware::CertificateAuthorizationDecision;
 
 let mut certs = RequestedCertificateSet::default();
 certs.types.insert("certifier_id".into(), vec!["field_name".into()]);
@@ -155,9 +160,20 @@ certs.types.insert("certifier_id".into(), vec!["field_name".into()]);
 let config = AuthMiddlewareConfigBuilder::new()
     .wallet(wallet)
     .certificates_to_request(certs)
+    .trusted_certifiers(vec![certifier_identity_key])
+    .certificate_authorizer(Box::new(|identity_key, certificates| {
+        Box::pin(async move {
+            // Apply application policy such as revocation/currentness here.
+            if application_admits(&identity_key, &certificates).await {
+                CertificateAuthorizationDecision::Accept
+            } else {
+                CertificateAuthorizationDecision::Reject("certificate is not current".into())
+            }
+        })
+    }))
     .on_certificates_received(Box::new(|identity_key, certificates| {
         Box::pin(async move {
-            // Process received certificates
+            // Observe only after structural + application admission succeeds.
             println!("Received {} certs from {}", certificates.len(), identity_key);
         })
     }))
@@ -166,6 +182,13 @@ let config = AuthMiddlewareConfigBuilder::new()
 ```
 
 Configure a nonempty `trusted_certifiers` set to engage certificate gating.
+Construction then requires a `certificate_authorizer`; omitting it is a
+configuration error. The SDK awaits this authorizer after structural proof
+validation and before marking the exact session certificate-valid. `Accept`
+opens that session, `Reject(reason)` keeps it closed, and an undecided callback
+times out after 30 seconds. The observation callback runs only after admission
+and cannot disable or release the HTTP gate.
+
 The well-known handler awaits SDK proof validation against the exact local
 session and its retained request, validates issuer/type/subject/signature policy,
 requires each proof keyring to match the exact retained field set (no missing,
@@ -187,11 +210,35 @@ batch proved by this exact request's authenticated BRC session. A separate
 `CertificateGate::validated_for_session(nonce, identity).await` reads a snapshot;
 callers must separately establish session liveness and their application policy.
 The old identity-only gate methods and `on_certificates_received` callback remain
-available for observation, but never authorize HTTP requests. In particular,
-calling `mark_validated(identity, certs)` cannot release a session's HTTP gate.
+available for observation, but never authorize HTTP requests. Their compatibility
+maps are independently capped at 1024 identities and expire after 15 minutes.
+In particular, calling `mark_validated(identity, certs)` cannot release a
+session's HTTP gate.
 
-This source uses maintained `bsv-sdk` 0.8.1 at revision
-`13b2d4b40fa32e13ff13b553239d94d4375804df` via `[patch.crates-io]`.
+Construction atomically seals the SDK peer's certificate request and blocking
+authorizer at an exact monotonic generation. Later replacements—including
+same-shape non-empty requests or a different authorizer—are rejected by the SDK,
+so request-time consistency checks cannot race policy mutation. Configuration
+is validated before a compare-and-seal transaction; a rejected constructor does
+not seal the caller-owned peer and can be retried with compatible settings. The
+blocking wrapper stages the locally validated exact-session certificate batch,
+then an SDK commit hook promotes it atomically with terminal acceptance. SDK
+authority is therefore never visible before the HTTP gate's batch. Cancelling
+request dispatch before terminal acceptance rolls back only that attempt's
+provisional batch and permits an authenticated retry; explicit rejection and
+the 30-second decision timeout remain terminal for the session. The
+post-admission observer queue is capped at 1024 events; overflow is dropped
+without changing the admission decision. Application observation callbacks run
+sequentially and are cancelled after 30 seconds.
+
+An authentic general request blocked by a rejected authorizer receives a signed
+`403 ERR_CERTIFICATE_REJECTED`; a pending or timed-out decision receives a signed
+`408 CERTIFICATE_TIMEOUT`. The SDK issues the refusal-only signing capability
+only after session, identity, signature, request-payload, and replay validation.
+Malformed, forged, replayed, or session-mismatched requests remain unsigned.
+
+This source uses maintained `bsv-sdk` 0.8.1 at the revision pinned in
+`Cargo.toml` via `[patch.crates-io]`.
 Cargo ignores dependency-local patches: consuming workspaces must apply that
 same graph-wide patch. No registry publication is implied. Certificate currentness,
 revocation, grant policy and application authorization remain the consumer's

@@ -14,10 +14,42 @@ use futures_util::future::BoxFuture;
 
 use crate::error::AuthMiddlewareError;
 
+/// Blocking admission decision returned by a [`CertificateAuthorizer`].
+///
+/// `Accept` permits the SDK to complete certificate admission for the exact
+/// authenticated session and proof batch. `Reject` keeps that session closed
+/// and preserves the supplied reason for the signed HTTP refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CertificateAuthorizationDecision {
+    /// Admit the structurally valid certificate proof.
+    Accept,
+    /// Refuse the proof with a caller-defined reason.
+    Reject(String),
+}
+
+/// Async, blocking certificate admission callback.
+///
+/// The callback receives the authenticated peer identity and the exact batch
+/// of structurally valid certificates. Unlike [`OnCertificatesReceived`], it
+/// is awaited before the SDK grants certificate authority.
+pub type CertificateAuthorizer = Box<
+    dyn Fn(
+            String,
+            Vec<VerifiableCertificate>,
+        ) -> BoxFuture<'static, CertificateAuthorizationDecision>
+        + Send
+        + Sync,
+>;
+
 /// Callback type invoked when certificates are received from a peer.
 ///
-/// Receives `(sender_identity_key, certificates)`. The callback is invoked
-/// fire-and-forget: panics are caught and logged but do not affect request flow.
+/// Receives `(sender_identity_key, certificates)`. When configured through
+/// [`AuthMiddlewareConfigBuilder`], the callback is scheduled only after SDK
+/// structural validation and blocking application authorization have succeeded.
+/// It is observation only and cannot grant or veto session authority. Events
+/// use a bounded queue; overload drops observations without changing admission.
+/// Callbacks run sequentially with a fixed timeout, so their task count cannot
+/// grow with handshake volume.
 pub type OnCertificatesReceived =
     Box<dyn Fn(String, Vec<VerifiableCertificate>) -> BoxFuture<'static, ()> + Send + Sync>;
 
@@ -34,6 +66,10 @@ impl<W: WalletInterface> std::fmt::Debug for AuthMiddlewareConfig<W> {
             .field(
                 "on_certificates_received",
                 &self.on_certificates_received.is_some(),
+            )
+            .field(
+                "certificate_authorizer",
+                &self.certificate_authorizer.is_some(),
             )
             .field("log_level", &self.log_level)
             .finish()
@@ -79,6 +115,9 @@ pub struct AuthMiddlewareConfig<W: WalletInterface> {
     pub session_manager: Option<SessionManager>,
     /// Optional callback invoked when certificates are received from a peer.
     pub on_certificates_received: Option<Arc<OnCertificatesReceived>>,
+    /// Blocking admission callback required whenever certificate gating is
+    /// engaged by a non-empty [`Self::trusted_certifiers`] set.
+    pub certificate_authorizer: Option<Arc<CertificateAuthorizer>>,
     /// Optional verbosity for a default `tracing` subscriber.
     ///
     /// When `None` (the default), this crate does not install any tracing
@@ -130,6 +169,7 @@ pub struct AuthMiddlewareConfigBuilder<W: WalletInterface> {
     trusted_certifiers: Vec<String>,
     session_manager: Option<SessionManager>,
     on_certificates_received: Option<Arc<OnCertificatesReceived>>,
+    certificate_authorizer: Option<Arc<CertificateAuthorizer>>,
     log_level: Option<tracing::Level>,
 }
 
@@ -142,6 +182,7 @@ impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
     /// - `certificates_to_request`: None
     /// - `session_manager`: None
     /// - `on_certificates_received`: None
+    /// - `certificate_authorizer`: None
     /// - `log_level`: None (caller owns tracing setup)
     pub fn new() -> Self {
         Self {
@@ -151,6 +192,7 @@ impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
             trusted_certifiers: Vec::new(),
             session_manager: None,
             on_certificates_received: None,
+            certificate_authorizer: None,
             log_level: None,
         }
     }
@@ -195,6 +237,18 @@ impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
         self
     }
 
+    /// Set the blocking certificate admission callback.
+    ///
+    /// A non-empty `trusted_certifiers` set requires this callback. The SDK
+    /// awaits its decision after structural validation and before marking the
+    /// exact session certificate-valid. Rejection or timeout fails closed. If
+    /// request dispatch is cancelled before the callback decides, the pending
+    /// attempt is removed and an authenticated retry may decide the session.
+    pub fn certificate_authorizer(mut self, authorizer: CertificateAuthorizer) -> Self {
+        self.certificate_authorizer = Some(Arc::new(authorizer));
+        self
+    }
+
     /// Set the tracing verbosity for an optional default subscriber.
     ///
     /// Setting this field only records the desired level on the built config —
@@ -224,6 +278,7 @@ impl<W: WalletInterface> AuthMiddlewareConfigBuilder<W> {
             trusted_certifiers: self.trusted_certifiers,
             session_manager: self.session_manager,
             on_certificates_received: self.on_certificates_received,
+            certificate_authorizer: self.certificate_authorizer,
             log_level: self.log_level,
         };
 
@@ -569,6 +624,28 @@ mod tests {
             .build()
             .unwrap();
         assert!(config.on_certificates_received.is_none());
+    }
+
+    #[test]
+    fn test_certificate_authorizer_can_be_set() {
+        let authorizer: CertificateAuthorizer = Box::new(|_identity_key, _certs| {
+            Box::pin(async { CertificateAuthorizationDecision::Accept })
+        });
+        let config = AuthMiddlewareConfigBuilder::new()
+            .wallet(MockWallet)
+            .certificate_authorizer(authorizer)
+            .build()
+            .unwrap();
+        assert!(config.certificate_authorizer.is_some());
+    }
+
+    #[test]
+    fn test_certificate_authorizer_defaults_to_none() {
+        let config = AuthMiddlewareConfigBuilder::new()
+            .wallet(MockWallet)
+            .build()
+            .unwrap();
+        assert!(config.certificate_authorizer.is_none());
     }
 
     #[test]

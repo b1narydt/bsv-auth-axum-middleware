@@ -1,6 +1,6 @@
 [package]
 name = "bsv-auth-axum-middleware"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.88"
 description = "BSV BRC-104 (BRC-103 over HTTP) mutual authentication middleware for axum (port of bsv-auth-actix-middleware)"
@@ -58,8 +58,8 @@ dashmap = "6.1"
 indexmap = "2"
 
 [dev-dependencies]
-tokio = { version = "1.51", features = ["full"] }
+tokio = { version = "1.51", features = ["full", "test-util"] }
 reqwest = { version = "0.12", features = ["json"] }
 
 [patch.crates-io]
-bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", rev = "13b2d4b40fa32e13ff13b553239d94d4375804df" }
+bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", rev = "5ad4982edfb250e10d7c8f81f516b3283c0f1e2e" }

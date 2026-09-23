@@ -77,51 +77,51 @@ pub async fn create_test_server() -> String {
     let addr: SocketAddr = listener.local_addr().expect("local_addr");
     let base_url = format!("http://{addr}");
 
-    let server_key = PrivateKey::from_random().expect("failed to generate server key");
-    let server_wallet = MockWallet::new(server_key);
+    let server_wallet =
+        MockWallet::new(PrivateKey::from_random().expect("failed to generate server key"));
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
-    // Build config + layer in the calling async context so we don't have to
-    // send `ActixTransport` across threads without proper setup.
-    let transport = Arc::new(ActixTransport::new());
-    let peer = Arc::new(Peer::new(server_wallet.clone(), transport.clone()));
-
-    let config = AuthMiddlewareConfigBuilder::new()
-        .wallet(server_wallet)
-        .allow_unauthenticated(false)
-        .build()
-        .expect("failed to build middleware config");
-
-    let layer = AuthLayer::from_config(config, peer.clone(), transport.clone())
-        .await
-        .expect("failed to build auth layer");
-
-    let app = Router::new()
-        .route("/", get(handler_root))
-        .route("/other-endpoint", post(handler_other_endpoint_post))
-        .route("/other-endpoint", get(handler_other_endpoint_get))
-        .route("/error-500", post(handler_error_500))
-        .route("/put-endpoint", put(handler_put))
-        .route("/delete-endpoint", delete(handler_delete))
-        .route("/large-upload", post(handler_large_upload))
-        .route("/query-endpoint", get(handler_query))
-        .route("/custom-headers", get(handler_custom_headers))
-        .layer(layer);
-
-    println!("Test server started at {base_url}");
-
-    // Spawn a background thread with its own Tokio runtime. The thread is
-    // leaked (never joined) so the server lives for the process lifetime,
-    // matching the actix `std::mem::forget(server)` pattern.
+    // Construct Peer inside the same long-lived runtime as axum::serve. Peer::new
+    // owns a spawned receive loop; creating it on the caller's #[tokio::test]
+    // runtime would kill that loop as soon as whichever test initialized the
+    // shared server finished.
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("create server runtime");
         rt.block_on(async move {
+            let transport = Arc::new(ActixTransport::new());
+            let peer = Arc::new(Peer::new(server_wallet.clone(), transport.clone()));
+            let config = AuthMiddlewareConfigBuilder::new()
+                .wallet(server_wallet)
+                .allow_unauthenticated(false)
+                .build()
+                .expect("failed to build middleware config");
+            let layer = AuthLayer::from_config(config, peer, transport)
+                .await
+                .expect("failed to build auth layer");
+            let app = Router::new()
+                .route("/", get(handler_root))
+                .route("/other-endpoint", post(handler_other_endpoint_post))
+                .route("/other-endpoint", get(handler_other_endpoint_get))
+                .route("/error-500", post(handler_error_500))
+                .route("/put-endpoint", put(handler_put))
+                .route("/delete-endpoint", delete(handler_delete))
+                .route("/large-upload", post(handler_large_upload))
+                .route("/query-endpoint", get(handler_query))
+                .route("/custom-headers", get(handler_custom_headers))
+                .layer(layer);
             let tokio_listener =
                 TcpListener::from_std(listener).expect("convert to tokio listener");
+            ready_tx.send(()).expect("signal test server readiness");
             axum::serve(tokio_listener, app)
                 .await
                 .expect("test server serve");
         });
     });
+
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("test server failed to become ready");
+    println!("Test server started at {base_url}");
 
     base_url
 }
@@ -303,7 +303,7 @@ pub async fn create_cert_test_server() -> CertTestContext {
     let certs_received = Arc::new(tokio::sync::Mutex::new(Vec::<VerifiableCertificate>::new()));
     let certs_received_cb = certs_received.clone();
 
-    // Build the onCertificatesReceived callback
+    // Build the onCertificatesReceived callback.
     let on_certs_received: OnCertificatesReceived = Box::new(
         move |sender_key: String, certs: Vec<VerifiableCertificate>| {
             let certs_store = certs_received_cb.clone();
@@ -319,49 +319,56 @@ pub async fn create_cert_test_server() -> CertTestContext {
         },
     );
 
-    let transport = Arc::new(ActixTransport::new());
-    let peer = Arc::new(Peer::new(server_wallet.clone(), transport.clone()));
-
-    let config = AuthMiddlewareConfigBuilder::new()
-        .wallet(server_wallet)
-        .allow_unauthenticated(false)
-        .certificates_to_request(certs_to_request)
-        .trusted_certifiers(vec![certifier_identity_hex])
-        .on_certificates_received(on_certs_received)
-        .build()
-        .expect("failed to build cert middleware config");
-
-    let layer = AuthLayer::from_config(config, peer.clone(), transport.clone())
-        .await
-        .expect("failed to build cert auth layer");
-
-    let certs_received_state = certs_received.clone();
-
-    let app = Router::new()
-        .route("/", get(handler_root))
-        .route("/cert-protected-endpoint", post(handler_cert_protected))
-        .with_state(certs_received_state)
-        .layer(layer);
-
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind cert test listener");
     std_listener.set_nonblocking(true).expect("set_nonblocking");
     let addr: SocketAddr = std_listener.local_addr().expect("local_addr");
     let base_url = format!("http://{addr}");
 
-    println!("[cert_server] Certificate test server started at {base_url}");
+    let certs_received_state = certs_received.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
-    // Spawn a dedicated background thread with its own Tokio runtime,
-    // matching the pattern from create_test_server. The thread is leaked
-    // so the server lives for the process lifetime.
+    // Peer and its receive loop must belong to the server runtime, not the
+    // short-lived runtime of the test that requested this server.
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("create cert server runtime");
         rt.block_on(async move {
+            let transport = Arc::new(ActixTransport::new());
+            let peer = Arc::new(Peer::new(server_wallet.clone(), transport.clone()));
+            let config = AuthMiddlewareConfigBuilder::new()
+                .wallet(server_wallet)
+                .allow_unauthenticated(false)
+                .certificates_to_request(certs_to_request)
+                .trusted_certifiers(vec![certifier_identity_hex])
+                .certificate_authorizer(Box::new(|_, _| {
+                    Box::pin(async {
+                        bsv_auth_axum_middleware::CertificateAuthorizationDecision::Accept
+                    })
+                }))
+                .on_certificates_received(on_certs_received)
+                .build()
+                .expect("failed to build cert middleware config");
+            let layer = AuthLayer::from_config(config, peer, transport)
+                .await
+                .expect("failed to build cert auth layer");
+            let app = Router::new()
+                .route("/", get(handler_root))
+                .route("/cert-protected-endpoint", post(handler_cert_protected))
+                .with_state(certs_received_state)
+                .layer(layer);
             let listener = TcpListener::from_std(std_listener).expect("convert to tokio listener");
+            ready_tx
+                .send(())
+                .expect("signal cert test server readiness");
             axum::serve(listener, app)
                 .await
                 .expect("cert test server serve");
         });
     });
+
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("certificate test server failed to become ready");
+    println!("[cert_server] Certificate test server started at {base_url}");
 
     CertTestContext {
         server_base_url: base_url,
@@ -387,8 +394,7 @@ async fn handler_cert_protected(
         body.len()
     );
 
-    // Wait briefly for certificate callback to fire
-    // (the callback runs in a spawned task and may not have completed yet)
+    // Wait briefly for the post-admission observer task to invoke the callback.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let store = certs.lock().await;

@@ -13,9 +13,13 @@ pub mod transport;
 
 pub use certificate::{
     certificate_listener_task, validate_certificate, CertRejectReason, CertificateGate,
-    CertificateValidationPolicy,
+    CertificateValidationPolicy, CERTIFICATE_OBSERVER_CALLBACK_TIMEOUT,
+    CERTIFICATE_OBSERVER_EVENT_CAPACITY,
 };
-pub use config::{AuthMiddlewareConfig, AuthMiddlewareConfigBuilder, OnCertificatesReceived};
+pub use config::{
+    AuthMiddlewareConfig, AuthMiddlewareConfigBuilder, CertificateAuthorizationDecision,
+    CertificateAuthorizer, OnCertificatesReceived,
+};
 pub use error::AuthMiddlewareError;
 pub use extractor::{Authenticated, AuthenticatedSession};
 pub use helpers::{extract_auth_headers, AuthHeaders};
