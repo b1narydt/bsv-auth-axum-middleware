@@ -62,4 +62,4 @@ tokio = { version = "1.51", features = ["full", "test-util"] }
 reqwest = { version = "0.12", features = ["json"] }
 
 [patch.crates-io]
-bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", rev = "5ad4982edfb250e10d7c8f81f516b3283c0f1e2e" }
+bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", rev = "ba61a7f603ead1a6dfbf3b370c0741301e09ccab" }

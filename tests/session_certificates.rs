@@ -178,6 +178,57 @@ async fn proof_message(
     }
 }
 
+/// A signed `certificateResponse` carrying no certificates: what a peer that
+/// holds no certificate sends back to the handshake's request.
+async fn empty_proof_message(
+    wallet: &MockWallet,
+    identity: &str,
+    verifier: &str,
+    session: &str,
+    tag: u8,
+) -> bsv::auth::types::AuthMessage {
+    use bsv::primitives::public_key::PublicKey;
+    use bsv::wallet::interfaces::{CreateSignatureArgs, WalletInterface};
+    use bsv::wallet::types::{Counterparty, CounterpartyType, Protocol};
+    let nonce = B64.encode([tag; 32]);
+    let certs: Vec<bsv::auth::certificates::VerifiableCertificate> = Vec::new();
+    let signature = wallet
+        .create_signature(
+            CreateSignatureArgs {
+                data: Some(serde_json::to_vec(&certs).unwrap()),
+                hash_to_directly_sign: None,
+                protocol_id: Protocol {
+                    security_level: 2,
+                    protocol: bsv::auth::types::AUTH_PROTOCOL_ID.to_string(),
+                },
+                key_id: format!("{nonce} {session}"),
+                counterparty: Counterparty {
+                    counterparty_type: CounterpartyType::Other,
+                    public_key: Some(PublicKey::from_string(verifier).unwrap()),
+                },
+                privileged: false,
+                privileged_reason: None,
+                seek_permission: None,
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .signature;
+    bsv::auth::types::AuthMessage {
+        version: "0.1".to_string(),
+        message_type: bsv::auth::types::MessageType::CertificateResponse,
+        identity_key: identity.to_string(),
+        nonce: Some(nonce),
+        your_nonce: Some(session.to_string()),
+        initial_nonce: None,
+        certificates: Some(certs),
+        requested_certificates: None,
+        payload: None,
+        signature: Some(signature),
+    }
+}
+
 async fn general_headers(
     wallet: &MockWallet,
     identity: &str,
@@ -957,5 +1008,101 @@ async fn sdk_eviction_removes_the_corresponding_certificate_batch() {
         gate.validated_for_session(&newest, &holder).await.unwrap()[0].serial_number,
         certs[1].serial_number
     );
+    task.abort();
+}
+
+/// Certificate-less admission: an empty proof bound to its authenticated
+/// session reaches the blocking authorizer with an empty batch; `Accept`
+/// grants that exact session authority, and its general requests carry an
+/// empty certificate set to the application.
+#[tokio::test]
+async fn empty_proof_accepted_by_the_authorizer_grants_session_authority() {
+    use std::sync::atomic::Ordering;
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
+    let seen_for_authorizer = seen.clone();
+    let authorizer: CertificateAuthorizer = Box::new(move |identity, certificates| {
+        let seen = seen_for_authorizer.clone();
+        Box::pin(async move {
+            seen.lock().unwrap().push((identity, certificates.len()));
+            if certificates.is_empty() {
+                CertificateAuthorizationDecision::Accept
+            } else {
+                CertificateAuthorizationDecision::Reject("unexpected certificate".to_string())
+            }
+        })
+    });
+    let (url, task, wallet, holder, verifier, _certificate, gate, handler_called, _peer) =
+        start_policy_server(authorizer).await;
+    let http = reqwest::Client::new();
+    let session = handshake(&http, &url, &holder).await;
+    let proof = empty_proof_message(&wallet, &holder, &verifier, &session, 91).await;
+    let proof_response = http
+        .post(format!("{url}.well-known/auth"))
+        .json(&proof)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(proof_response.status(), 200);
+    assert_eq!(*seen.lock().unwrap(), vec![(holder.clone(), 0)]);
+    let batch = gate
+        .validated_for_session(&session, &holder)
+        .await
+        .expect("the accepted empty batch is the session's authority");
+    assert!(batch.is_empty());
+
+    let response = http
+        .get(&url)
+        .headers(general_headers(&wallet, &holder, &verifier, &session, 92, true).await)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.headers().get("x-bsv-auth-signature").is_some());
+    assert!(handler_called.load(Ordering::SeqCst));
+    task.abort();
+}
+
+/// `Reject` on an empty proof is the same terminal refusal as on a
+/// certificate: no session authority, signed 403 with the authorizer's reason.
+#[tokio::test]
+async fn empty_proof_rejected_by_the_authorizer_yields_signed_403() {
+    use std::sync::atomic::Ordering;
+
+    let authorizer: CertificateAuthorizer = Box::new(|_, certificates| {
+        Box::pin(async move {
+            assert!(certificates.is_empty());
+            CertificateAuthorizationDecision::Reject("no delegation record".to_string())
+        })
+    });
+    let (url, task, wallet, holder, verifier, _certificate, gate, handler_called, _peer) =
+        start_policy_server(authorizer).await;
+    let http = reqwest::Client::new();
+    let session = handshake(&http, &url, &holder).await;
+    let proof = empty_proof_message(&wallet, &holder, &verifier, &session, 93).await;
+    let proof_response = http
+        .post(format!("{url}.well-known/auth"))
+        .json(&proof)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(proof_response.status(), 200);
+    assert!(gate
+        .validated_for_session(&session, &holder)
+        .await
+        .is_none());
+
+    let response = http
+        .get(&url)
+        .headers(general_headers(&wallet, &holder, &verifier, &session, 94, true).await)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert!(response.headers().get("x-bsv-auth-signature").is_some());
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["code"], "ERR_CERTIFICATE_REJECTED");
+    assert_eq!(body["description"], "no delegation record");
+    assert!(!handler_called.load(Ordering::SeqCst));
     task.abort();
 }
