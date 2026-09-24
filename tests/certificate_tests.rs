@@ -170,26 +170,16 @@ async fn test_cert_protected_endpoint() {
     );
 }
 
-/// GAP G4 regression: a `certificateResponse` message arriving at
-/// `/.well-known/auth` with an empty `certificates` array must yield a 400
-/// with the minimal body `{"status":"No certificates provided"}`, per TS
-/// auth-express-middleware:437-442.
-///
-/// Crucially, this is *not* the standard `{status,code,message}` error shape
-/// -- it is a single-field body. Asserting byte-for-byte parity here guards
-/// against any well-meaning refactor that "helpfully" wraps it back into the
-/// standard envelope.
+/// With a certificate gate configured, an empty `certificateResponse` is a
+/// proof batch bound to a pending authenticated session. Hand-crafted and
+/// unbound, it is refused through the session-binding path — never the
+/// ungated 400 short-circuit — and records nothing.
 #[tokio::test]
-async fn test_empty_cert_response_returns_400() {
+async fn test_gated_empty_cert_response_is_refused_as_unbound() {
     init_tracing();
     let ctx = create_cert_test_server().await;
     let base_url = &ctx.server_base_url;
 
-    // Hand-craft a certificateResponse AuthMessage with empty certs. We use
-    // the wire JSON directly (camelCase per the SDK's serde config) rather
-    // than reaching into the SDK, because this test is specifically about
-    // how the middleware reacts to a malformed/empty cert payload from an
-    // untrusted peer -- including peers not speaking the Rust SDK.
     let msg = serde_json::json!({
         "version": "0.1",
         "messageType": "certificateResponse",
@@ -209,26 +199,23 @@ async fn test_empty_cert_response_returns_400() {
         .await
         .expect("POST /.well-known/auth should return a response");
 
-    assert_eq!(
-        resp.status().as_u16(),
-        400,
-        "empty certificateResponse must return 400"
+    assert!(
+        !resp.status().is_success(),
+        "an unbound empty certificateResponse must be refused"
     );
-
     let body: serde_json::Value = resp.json().await.expect("response body should be JSON");
-
-    // Exact shape match: one field, one value, no extras.
-    assert_eq!(
+    assert_ne!(
         body,
-        serde_json::json!({"status": "No certificates provided"})
+        serde_json::json!({"status": "No certificates provided"}),
+        "the ungated short-circuit must not answer on a gated layer"
     );
+    assert!(ctx.certs_received.lock().await.is_empty());
 }
 
-/// GAP G4 regression: when the `certificates` field is entirely absent
-/// (not just an empty array), the middleware treats that the same way --
-/// TS's `!Array.isArray(certs) || certs.length === 0` catches both cases.
+/// A `certificateResponse` with the `certificates` field entirely absent is
+/// malformed on a gated layer too: refused, nothing recorded.
 #[tokio::test]
-async fn test_cert_response_with_missing_certs_field_returns_400() {
+async fn test_gated_cert_response_with_missing_certs_field_is_refused() {
     init_tracing();
     let ctx = create_cert_test_server().await;
     let base_url = &ctx.server_base_url;
@@ -252,13 +239,52 @@ async fn test_cert_response_with_missing_certs_field_returns_400() {
         .await
         .expect("POST /.well-known/auth should return a response");
 
-    assert_eq!(resp.status().as_u16(), 400);
+    assert!(!resp.status().is_success());
+    assert!(ctx.certs_received.lock().await.is_empty());
+}
 
-    let body: serde_json::Value = resp.json().await.expect("response body should be JSON");
-    assert_eq!(
-        body,
-        serde_json::json!({"status": "No certificates provided"})
-    );
+/// GAP G4, kept for the UNGATED layer: with no certificate gate configured, a
+/// `certificateResponse` with empty or absent `certificates` yields a 400 with
+/// the minimal body `{"status":"No certificates provided"}`, per TS
+/// auth-express-middleware:437-442 — a single-field body, not the standard
+/// `{status,code,message}` envelope.
+#[tokio::test]
+async fn test_ungated_empty_cert_response_returns_400() {
+    init_tracing();
+    let base_url = common::test_server::create_test_server().await;
+    let url = format!("{base_url}/.well-known/auth");
+    let client = reqwest::Client::new();
+    for msg in [
+        serde_json::json!({
+            "version": "0.1",
+            "messageType": "certificateResponse",
+            "identityKey": "02".to_string() + &"0".repeat(64),
+            "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "yourNonce": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA=",
+            "certificates": []
+        }),
+        serde_json::json!({
+            "version": "0.1",
+            "messageType": "certificateResponse",
+            "identityKey": "02".to_string() + &"0".repeat(64),
+            "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "yourNonce": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA="
+        }),
+    ] {
+        let resp = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .json(&msg)
+            .send()
+            .await
+            .expect("POST /.well-known/auth should return a response");
+        assert_eq!(resp.status().as_u16(), 400);
+        let body: serde_json::Value = resp.json().await.expect("response body should be JSON");
+        assert_eq!(
+            body,
+            serde_json::json!({"status": "No certificates provided"})
+        );
+    }
 }
 
 /// Test 12 (TS cert test): Certificate request flow -- client requests certs

@@ -659,8 +659,13 @@ async fn handle_handshake<W: WalletInterface + Clone + 'static>(
             // GAP G4: if a certificate-response carries no certificates, TS
             // auth-express-middleware:437-442 short-circuits with 400 and the
             // minimal body `{"status":"No certificates provided"}` (not the
-            // standard error shape). Mirror that exactly.
+            // standard error shape). Mirrored exactly while no certificate
+            // gate is configured. With a gate, an empty response is a proof
+            // batch like any other: it is bound to its authenticated session
+            // and decided by the blocking authorizer (certificate-less
+            // admission against a record the application holds).
             if matches!(auth_msg.message_type, MessageType::CertificateResponse)
+                && certificate_gate.is_none()
                 && auth_msg
                     .certificates
                     .as_ref()

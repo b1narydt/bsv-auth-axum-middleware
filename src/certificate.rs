@@ -437,9 +437,9 @@ impl CertificateGate {
             )
         };
         let policy = self.policy.as_ref().ok_or_else(reject)?;
-        if context.certificates.is_empty() {
-            return Err(reject());
-        }
+        // An empty batch is staged like any other: the SDK routes it here only
+        // for a session that still requires certificates, and the blocking
+        // authorizer has already accepted it (certificate-less admission).
         let requested = context.requested_certificates.as_ref().ok_or_else(reject)?;
 
         // The SDK decrypts supplied keys on the nonempty path, but does not
@@ -594,11 +594,9 @@ impl CertificateGate {
         {
             return Err(reject());
         }
-        let certs = message
-            .certificates
-            .as_ref()
-            .filter(|c| !c.is_empty())
-            .ok_or_else(reject)?;
+        // A missing `certificates` field is malformed; an empty one is a
+        // proof batch the blocking authorizer decides.
+        let certs = message.certificates.as_ref().ok_or_else(reject)?;
         // The SDK decrypts the supplied keys on the nonempty path, but does
         // not enforce that they equal the retained field request. A valid key
         // for a different field is not evidence for the field we requested.
